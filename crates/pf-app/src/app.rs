@@ -8,6 +8,9 @@ use crate::ui::main_window::{MainWindow, UiAction};
 use crate::ui::overlay::{OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayAction, OverlayWindow};
 use crate::ui::queue_view::QueueUiAction;
 use crate::ui::shortcut_dialog::{ShortcutSettingsUpdate, show_shortcut_dialog};
+use crate::ui::spaces_dialog::{
+    SpaceDialogResult, show_move_to_space_dialog, show_rename_clip_dialog, show_space_editor,
+};
 use anyhow::Result;
 use gtk4::gio::{self, ApplicationFlags};
 use gtk4::glib;
@@ -768,7 +771,105 @@ fn handle_ui_action(state: &Rc<AppState>, action: UiAction) {
             let next = !state.queue.borrow().universal_paste;
             set_universal_paste(state, next);
         }
+        UiAction::NewSpace => open_space_editor(state, None),
+        UiAction::EditSpace(space_id) => {
+            let sp = state
+                .store
+                .borrow()
+                .list_spaces()
+                .ok()
+                .and_then(|v| v.into_iter().find(|s| s.id == space_id));
+            if let Some(space) = sp {
+                open_space_editor(state, Some(space));
+            }
+        }
+        UiAction::MoveClipToSpace { clip_id, space_id } => {
+            if state.store.borrow_mut().move_to_space(clip_id, space_id).is_ok() {
+                refresh_open_views(state);
+            }
+        }
+        UiAction::PromptMoveClip(clip_id) => {
+            let spaces = state.store.borrow().list_spaces().unwrap_or_default();
+            let cur = state
+                .store
+                .borrow()
+                .get_clip(clip_id)
+                .ok()
+                .flatten()
+                .map(|c| c.space_id)
+                .unwrap_or(1);
+            let st_c = Rc::clone(state);
+            show_move_to_space_dialog(
+                &state.app,
+                &spaces,
+                cur,
+                Rc::new(move |space_id| {
+                    if st_c.store.borrow_mut().move_to_space(clip_id, space_id).is_ok() {
+                        refresh_open_views(&st_c);
+                    }
+                }),
+            );
+        }
+        UiAction::PromptRenameClip(clip_id) => {
+            let current = state
+                .store
+                .borrow()
+                .get_clip(clip_id)
+                .ok()
+                .flatten()
+                .and_then(|c| c.title);
+            let st_c = Rc::clone(state);
+            show_rename_clip_dialog(
+                &state.app,
+                current.as_deref(),
+                Rc::new(move |new_title| {
+                    if st_c
+                        .store
+                        .borrow_mut()
+                        .set_clip_title(clip_id, new_title.as_deref())
+                        .is_ok()
+                    {
+                        refresh_open_views(&st_c);
+                    }
+                }),
+            );
+        }
     }
+}
+
+fn open_space_editor(state: &Rc<AppState>, existing: Option<pf_core::model::SpaceRecord>) {
+    let st_c = Rc::clone(state);
+    show_space_editor(
+        &state.app,
+        existing.as_ref(),
+        Rc::new(move |res| {
+            let outcome = match res {
+                SpaceDialogResult::Create { name, color, icon } => {
+                    st_c.store.borrow_mut().create_space(&name, &color, &icon).map(|_| ())
+                }
+                SpaceDialogResult::Update {
+                    id,
+                    name,
+                    color,
+                    icon,
+                } => st_c
+                    .store
+                    .borrow_mut()
+                    .update_space(id, &name, &color, &icon)
+                    .map(|_| ()),
+                SpaceDialogResult::Delete { id, delete_clips } => st_c
+                    .store
+                    .borrow_mut()
+                    .delete_space(id, delete_clips)
+                    .map(|_| ()),
+            };
+            if let Err(e) = outcome {
+                warn!(error = %e, "space operation failed");
+            } else {
+                refresh_open_views(&st_c);
+            }
+        }),
+    );
 }
 
 fn sync_queue_indicators(state: &Rc<AppState>) {

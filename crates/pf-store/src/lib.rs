@@ -140,6 +140,127 @@ impl Store {
         Ok(out)
     }
 
+    /// List all Spaces ordered by `position`, along with each Space's clip count.
+    pub fn list_spaces_with_counts(&self) -> Result<Vec<(SpaceRecord, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.name, s.color, s.icon, s.position, s.is_default, s.created_at,
+                    COUNT(c.id)
+             FROM spaces s
+             LEFT JOIN clips c ON c.space_id = s.id
+             GROUP BY s.id
+             ORDER BY s.position ASC, s.id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                SpaceRecord {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    color: r.get(2)?,
+                    icon: r.get(3)?,
+                    position: r.get(4)?,
+                    is_default: r.get::<_, i64>(5)? != 0,
+                    created_at: r.get(6)?,
+                },
+                usize::try_from(r.get::<_, i64>(7)?).unwrap_or(0),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Create a new custom Space.
+    pub fn create_space(&mut self, name: &str, color: &str, icon: &str) -> Result<SpaceRecord> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            bail!("space name cannot be empty");
+        }
+        let next_pos: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM spaces",
+            [],
+            |r| r.get(0),
+        )?;
+        let now = now_unix_ms();
+        self.conn.execute(
+            "INSERT INTO spaces (name, color, icon, position, is_default, created_at)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+            params![trimmed, color, icon, next_pos, now],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        Ok(SpaceRecord {
+            id,
+            name: trimmed.to_string(),
+            color: color.to_string(),
+            icon: icon.to_string(),
+            position: next_pos,
+            is_default: false,
+            created_at: now,
+        })
+    }
+
+    /// Rename or restyle an existing Space.
+    pub fn update_space(&mut self, id: i64, name: &str, color: &str, icon: &str) -> Result<bool> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            bail!("space name cannot be empty");
+        }
+        let changed = self.conn.execute(
+            "UPDATE spaces SET name = ?1, color = ?2, icon = ?3 WHERE id = ?4",
+            params![trimmed, color, icon, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Delete a non-default Space. If `delete_clips` is false, clips in this Space are moved
+    /// to the default Space ("General"); if true, they are deleted along with unreferenced blobs.
+    pub fn delete_space(&mut self, id: i64, delete_clips: bool) -> Result<bool> {
+        let default_id = self.default_space_id()?;
+        if id == default_id {
+            bail!("cannot delete the default Space");
+        }
+        let tx = self.conn.transaction()?;
+        let mut blobs = Vec::new();
+        let mut thumbs = Vec::new();
+        if delete_clips {
+            let clip_ids: Vec<i64> = {
+                let mut stmt = tx.prepare("SELECT id FROM clips WHERE space_id = ?1")?;
+                let rows = stmt.query_map(params![id], |r| r.get(0))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            if !clip_ids.is_empty() {
+                let files = collect_clip_files_tx(&tx, &clip_ids)?;
+                blobs = files.0;
+                thumbs = files.1;
+                tx.execute("DELETE FROM clips WHERE space_id = ?1", params![id])?;
+            }
+        } else {
+            tx.execute(
+                "UPDATE clips SET space_id = ?1 WHERE space_id = ?2",
+                params![default_id, id],
+            )?;
+        }
+        let deleted = tx.execute("DELETE FROM spaces WHERE id = ?1", params![id])?;
+        tx.commit()?;
+
+        if !blobs.is_empty() || !thumbs.is_empty() {
+            self.cleanup_unreferenced_files(&blobs, &thumbs)?;
+            self.wal_checkpoint_truncate()?;
+        }
+        Ok(deleted > 0)
+    }
+
+    /// Set or clear a user-defined label/title on a clip (automatically indexed in FTS5).
+    pub fn set_clip_title(&mut self, id: i64, title: Option<&str>) -> Result<bool> {
+        let cleaned = title.map(str::trim).filter(|s| !s.is_empty());
+        let changed = self.conn.execute(
+            "UPDATE clips SET title = ?1 WHERE id = ?2",
+            params![cleaned, id],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Return the ID of the default Space ("General").
     pub fn default_space_id(&self) -> Result<i64> {
         self.conn
@@ -1223,6 +1344,43 @@ mod tests {
 
         assert_eq!(store.queue_clear().unwrap(), 2);
         assert_eq!(store.queue_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn spaces_crud_delete_moves_clips_and_titles_are_searchable() {
+        let (_dir, mut store) = test_store();
+        let cfg = Config::default();
+
+        let sp = store
+            .create_space("Clients", "#e01b24", "folder-symbolic")
+            .unwrap();
+        assert_eq!(sp.name, "Clients");
+
+        let c1 = match store.insert_raw_clip(&raw_text("invoice body", 100), &cfg).unwrap() {
+            InsertOutcome::Inserted(c) => c.id,
+            _ => unreachable!(),
+        };
+        assert!(store.move_to_space(c1, sp.id).unwrap());
+        assert!(store.set_clip_title(c1, Some("Acme Q4 Contract")).unwrap());
+
+        // Title is indexed in FTS5
+        let hits = store
+            .list_clips(&ClipFilter {
+                query: Some("Contract".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title.as_deref(), Some("Acme Q4 Contract"));
+
+        // Default space cannot be deleted
+        let def_id = store.default_space_id().unwrap();
+        assert!(store.delete_space(def_id, false).is_err());
+
+        // Deleting custom space with delete_clips=false moves c1 back to General
+        assert!(store.delete_space(sp.id, false).unwrap());
+        let moved = store.get_clip(c1).unwrap().unwrap();
+        assert_eq!(moved.space_id, def_id);
     }
 
     fn walk_files(dir: &Path) -> usize {

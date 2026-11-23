@@ -5,10 +5,10 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, Image, Label,
-    ListBox, ListBoxRow, ListItem, ListView, Orientation, Paned, PolicyType, ScrolledWindow,
-    SearchEntry, Separator, SignalListItemFactory, SingleSelection, Stack, ToggleButton, gdk,
-    pango,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, DragSource, DropTarget,
+    EventControllerKey, Image, Label, ListBox, ListBoxRow, ListItem, ListView, Orientation, Paned,
+    PolicyType, ScrolledWindow, SearchEntry, Separator, SignalListItemFactory, SingleSelection,
+    Stack, ToggleButton, gdk, pango,
 };
 use pf_core::model::{ClipFilter, ClipKind, ClipRecord, now_unix_ms};
 use pf_store::Store;
@@ -33,6 +33,11 @@ pub enum UiAction {
     AddToQueue(i64),
     Queue(QueueUiAction),
     ToggleUniversalPasteShortcut,
+    NewSpace,
+    EditSpace(i64),
+    MoveClipToSpace { clip_id: i64, space_id: i64 },
+    PromptMoveClip(i64),
+    PromptRenameClip(i64),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -53,11 +58,14 @@ pub struct MainWindow {
     stack: Stack,
     queue_view: Rc<QueueView>,
     queue_badge: Label,
+    spaces_list: ListBox,
+    spaces_ids: Rc<RefCell<Vec<i64>>>,
     paused_banner: Label,
     pause_btn: ToggleButton,
     status_label: Label,
     nav_state: Rc<RefCell<NavSelection>>,
     store: Rc<RefCell<Store>>,
+    on_action: Rc<dyn Fn(UiAction)>,
 }
 
 impl MainWindow {
@@ -203,21 +211,33 @@ impl MainWindow {
             },
         );
 
-        add_section_header(&nav_list, &mut nav_targets, "SPACES");
-        if let Ok(spaces) = store.borrow().list_spaces() {
-            for sp in spaces {
-                add_nav_row(
-                    &nav_list,
-                    &mut nav_targets,
-                    &sp.icon,
-                    &sp.name,
-                    NavSelection {
-                        space_id: Some(sp.id),
-                        ..Default::default()
-                    },
-                );
-            }
+        let nav_scroll_inner = GtkBox::new(Orientation::Vertical, 4);
+        nav_scroll_inner.append(&nav_list);
+
+        // Spaces section (dynamic list with clip counts + drag-and-drop DropTarget per Space)
+        let spaces_header = GtkBox::new(Orientation::Horizontal, 4);
+        let sp_lbl = Label::new(Some("SPACES"));
+        sp_lbl.set_xalign(0.0);
+        sp_lbl.set_hexpand(true);
+        sp_lbl.add_css_class("pf-section-label");
+        let new_space_btn = Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("New Space")
+            .has_frame(false)
+            .build();
+        {
+            let act = Rc::clone(&on_action);
+            new_space_btn.connect_clicked(move |_| act(UiAction::NewSpace));
         }
+        spaces_header.append(&sp_lbl);
+        spaces_header.append(&new_space_btn);
+        nav_scroll_inner.append(&spaces_header);
+
+        let spaces_list = ListBox::new();
+        spaces_list.set_selection_mode(gtk4::SelectionMode::Single);
+        spaces_list.add_css_class("navigation-sidebar");
+        let spaces_ids: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+        nav_scroll_inner.append(&spaces_list);
 
         if let Some(first) = nav_list.row_at_index(0) {
             nav_list.select_row(Some(&first));
@@ -226,7 +246,7 @@ impl MainWindow {
         let nav_scroll = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Never)
             .vexpand(true)
-            .child(&nav_list)
+            .child(&nav_scroll_inner)
             .build();
         sidebar_box.append(&nav_scroll);
 
@@ -404,11 +424,14 @@ impl MainWindow {
             stack,
             queue_view,
             queue_badge,
+            spaces_list: spaces_list.clone(),
+            spaces_ids: Rc::clone(&spaces_ids),
             paused_banner,
             pause_btn,
             status_label,
             nav_state,
             store,
+            on_action: Rc::clone(&on_action),
         };
 
         // Wire toolbar signals
@@ -460,6 +483,7 @@ impl MainWindow {
             let search_c = main_win.search_entry.clone();
             let qv_c = Rc::clone(&main_win.queue_view);
             let mstack_c = main_stack.clone();
+            let sp_list_c = spaces_list.clone();
             let targets = Rc::new(nav_targets);
             nav_list.connect_row_selected(move |_lb, row_opt| {
                 let Some(row) = row_opt else { return };
@@ -467,6 +491,7 @@ impl MainWindow {
                 if idx < 0 {
                     return;
                 }
+                sp_list_c.unselect_all();
                 if let Some(target) = targets.get(idx as usize) {
                     *nav_c.borrow_mut() = target.clone();
                     if target.show_queue {
@@ -483,6 +508,42 @@ impl MainWindow {
                             search_c.text().as_str(),
                         );
                     }
+                }
+            });
+        }
+
+        // Wire Spaces sidebar selection
+        {
+            let model_c = main_win.model.clone();
+            let stack_c = main_win.stack.clone();
+            let status_c = main_win.status_label.clone();
+            let nav_c = Rc::clone(&main_win.nav_state);
+            let store_c = Rc::clone(&main_win.store);
+            let search_c = main_win.search_entry.clone();
+            let mstack_c = main_stack.clone();
+            let nav_list_c = nav_list.clone();
+            let sp_ids_c = Rc::clone(&spaces_ids);
+            spaces_list.connect_row_selected(move |_lb, row_opt| {
+                let Some(row) = row_opt else { return };
+                let idx = row.index();
+                if idx < 0 {
+                    return;
+                }
+                nav_list_c.unselect_all();
+                if let Some(&space_id) = sp_ids_c.borrow().get(idx as usize) {
+                    *nav_c.borrow_mut() = NavSelection {
+                        space_id: Some(space_id),
+                        ..Default::default()
+                    };
+                    mstack_c.set_visible_child_name("clips");
+                    reload_list(
+                        &store_c.borrow(),
+                        &model_c,
+                        &stack_c,
+                        &status_c,
+                        &nav_c.borrow(),
+                        search_c.text().as_str(),
+                    );
                 }
             });
         }
@@ -526,6 +587,14 @@ impl MainWindow {
                     }
                     if ctrl && (key == gdk::Key::q || key == gdk::Key::Q) {
                         act_c(UiAction::AddToQueue(id));
+                        return glib::Propagation::Stop;
+                    }
+                    if ctrl && (key == gdk::Key::m || key == gdk::Key::M) {
+                        act_c(UiAction::PromptMoveClip(id));
+                        return glib::Propagation::Stop;
+                    }
+                    if key == gdk::Key::F2 {
+                        act_c(UiAction::PromptRenameClip(id));
                         return glib::Propagation::Stop;
                     }
                     if key == gdk::Key::Delete && !search_c.has_focus() {
@@ -582,6 +651,7 @@ impl MainWindow {
         let qcount = self.store.borrow().queue_count().unwrap_or(0);
         self.queue_badge.set_text(&qcount.to_string());
         self.queue_view.refresh();
+        self.reload_spaces_sidebar();
         reload_list(
             &self.store.borrow(),
             &self.model,
@@ -590,6 +660,81 @@ impl MainWindow {
             &self.nav_state.borrow(),
             self.search_entry.text().as_str(),
         );
+    }
+
+    fn reload_spaces_sidebar(&self) {
+        let selected_space = self.nav_state.borrow().space_id;
+        while let Some(child) = self.spaces_list.first_child() {
+            self.spaces_list.remove(&child);
+        }
+        let mut ids = self.spaces_ids.borrow_mut();
+        ids.clear();
+
+        let spaces = self
+            .store
+            .borrow()
+            .list_spaces_with_counts()
+            .unwrap_or_default();
+
+        for (sp, count) in spaces {
+            ids.push(sp.id);
+            let h = GtkBox::new(Orientation::Horizontal, 6);
+            h.set_margin_top(4);
+            h.set_margin_bottom(4);
+            h.set_margin_start(6);
+            h.set_margin_end(4);
+
+            let img = Image::from_icon_name(&sp.icon);
+            let lbl = Label::new(Some(&sp.name));
+            lbl.set_xalign(0.0);
+            lbl.set_hexpand(true);
+            lbl.set_ellipsize(pango::EllipsizeMode::End);
+
+            let cnt = Label::new(Some(&count.to_string()));
+            cnt.add_css_class("pf-clip-meta");
+
+            let edit_btn = Button::builder()
+                .icon_name("document-edit-symbolic")
+                .tooltip_text("Edit Space")
+                .has_frame(false)
+                .build();
+            {
+                let sid = sp.id;
+                let act = Rc::clone(&self.on_action);
+                edit_btn.connect_clicked(move |_| act(UiAction::EditSpace(sid)));
+            }
+
+            h.append(&img);
+            h.append(&lbl);
+            h.append(&cnt);
+            h.append(&edit_btn);
+
+            let row = ListBoxRow::new();
+            row.set_child(Some(&h));
+
+            // GTK4 DropTarget: dropping a clip ID onto a Space row moves the clip to that Space
+            let drop_target = DropTarget::new(i64::static_type(), gdk::DragAction::MOVE);
+            {
+                let target_space_id = sp.id;
+                let act = Rc::clone(&self.on_action);
+                drop_target.connect_drop(move |_dt, val, _x, _y| {
+                    if let Ok(clip_id) = val.get::<i64>() {
+                        act(UiAction::MoveClipToSpace {
+                            clip_id,
+                            space_id: target_space_id,
+                        });
+                        return true;
+                    }
+                    false
+                });
+            }
+            row.add_controller(drop_target);
+
+            self.spaces_list.append(&row);
+            if selected_space == Some(sp.id) {
+                self.spaces_list.select_row(Some(&row));
+            }
+        }
     }
 }
 
@@ -773,6 +918,22 @@ fn build_row_factory(
             row_box.append(&copy_btn);
             row_box.append(&del_btn);
 
+            // GTK4 DragSource: drag any clip row onto a sidebar Space to move it
+            let drag_src = DragSource::new();
+            drag_src.set_actions(gdk::DragAction::MOVE);
+            {
+                let id_c = Rc::clone(&clip_id);
+                drag_src.connect_prepare(move |_src, _x, _y| {
+                    let id = id_c.get();
+                    if id > 0 {
+                        Some(gdk::ContentProvider::for_value(&id.to_value()))
+                    } else {
+                        None
+                    }
+                });
+            }
+            row_box.add_controller(drag_src);
+
             let widgets = Rc::new(RowWidgets {
                 clip_id,
                 thumb,
@@ -816,7 +977,11 @@ fn build_row_factory(
 
         w.clip_id.set(clip.id);
         w.kind_badge.set_text(&clip.kind.as_str().to_ascii_uppercase());
-        w.preview.set_text(&clip.preview);
+        if let Some(ref title) = clip.title {
+            w.preview.set_text(&format!("{title}\n{}", clip.preview));
+        } else {
+            w.preview.set_text(&clip.preview);
+        }
 
         let rel = format_relative_time(clip.last_used_at, now_unix_ms());
         let size = format_bytes(clip.byte_size);
