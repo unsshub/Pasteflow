@@ -1,0 +1,17 @@
+[package]
+name = "pf-x11"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+x11rb.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+pf-testkit = { path = "../pf-testkit" }
+
+[[bin]]
+name = "pf-x11-probe"
+path = "src/bin/pf-x11-probe.rs"

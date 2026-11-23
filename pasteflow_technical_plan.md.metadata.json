@@ -1,0 +1,6 @@
+{
+  "summary": "Complete technical planning document for PasteFlow, a native Rust + GTK4 clipboard manager for Linux Mint 22.1 Cinnamon (X11-first) recreating Pastily's functionality. Covers verified environment findings, Pastily feature comparison, stack comparison and recommendation (Rust + GTK4 + x11rb + rusqlite/FTS5 + ksni), clipboard engine design (XFixes, ICCCM, INCR, SAVE_TARGETS), Wayland strategy, SQLite schema, image storage, folder structure, UI specs, user flows, shortcuts, paste queue (XTEST), privacy model (memory-only sensitive clips, honest secure-deletion limits), performance budgets, dependencies, test matrix, 11 milestones, risks, complexity, checklist, and open questions.",
+  "updatedAt": "2026-11-23T14:44:20.841467983Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

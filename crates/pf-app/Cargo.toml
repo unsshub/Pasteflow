@@ -1,0 +1,20 @@
+[package]
+name = "pf-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pasteflow"
+path = "src/main.rs"
+
+[[bin]]
+name = "pf-m0-spike"
+path = "src/bin/pf-m0-spike.rs"
+
+[dependencies]
+anyhow.workspace = true
+gdk4-x11.workspace = true
+gtk4.workspace = true
+ksni.workspace = true
+x11rb.workspace = true

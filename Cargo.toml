@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pf-core",
+    "crates/pf-store",
+    "crates/pf-x11",
+    "crates/pf-app",
+    "crates/pf-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1.0"
+blake3 = "1.8"
+x11rb = { version = "0.14", features = ["xfixes", "xtest", "xkb"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+gtk4 = { version = "0.11", features = ["v4_14"] }
+gdk4-x11 = "0.11"
+ksni = { version = "0.3", features = ["blocking"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
