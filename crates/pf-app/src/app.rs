@@ -18,7 +18,8 @@ use gtk4::prelude::*;
 use gtk4::Application;
 use pf_core::backend::{ClipboardBackend, ClipboardEvent, HotkeyAction};
 use pf_core::config::{AppPaths, Config};
-use pf_store::{InsertOutcome, Store};
+use pf_core::model::{ClipKind, RawClip, now_unix_ms};
+use pf_store::{EphemeralStore, InsertOutcome, Store};
 use pf_x11::{HotkeyStatus, X11Engine};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -32,9 +33,11 @@ struct AppState {
     paths: AppPaths,
     config: RefCell<Config>,
     store: Rc<RefCell<Store>>,
+    ephemeral: Rc<RefCell<EphemeralStore>>,
     engine: RefCell<Option<X11Engine>>,
     queue: RefCell<QueueController>,
     x11_source_id: Cell<Option<u32>>,
+    expiry_timer_gen: Cell<u64>,
     hotkey_statuses: RefCell<Vec<HotkeyStatus>>,
     tray: RefCell<Option<ksni::blocking::Handle<PasteFlowTray>>>,
     main_window: RefCell<Option<MainWindow>>,
@@ -263,8 +266,10 @@ fn register_actions(app: &Application, state: Rc<RefCell<Option<Rc<AppState>>>>)
 fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
     let paths = AppPaths::resolve()?;
     let config = Config::load_or_default(&paths)?;
-    let store = Store::open(&paths)?;
+    let mut store = Store::open(&paths)?;
+    let recovered = store.recovered_from_corruption();
     let _ = store.sweep_orphan_blobs()?;
+    let _ = store.purge_expired_clips(now_unix_ms());
 
     let hold_guard = app.hold();
 
@@ -294,9 +299,11 @@ fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
         paths,
         config: RefCell::new(config),
         store: Rc::new(RefCell::new(store)),
+        ephemeral: Rc::new(RefCell::new(EphemeralStore::new())),
         engine: RefCell::new(engine),
         queue: RefCell::new(QueueController::default()),
         x11_source_id: Cell::new(None),
+        expiry_timer_gen: Cell::new(0),
         hotkey_statuses: RefCell::new(Vec::new()),
         tray: RefCell::new(tray_handle),
         main_window: RefCell::new(None),
@@ -308,6 +315,16 @@ fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
     // Apply global shortcut provider (X11 grab or Cinnamon custom keybindings)
     let statuses = apply_hotkey_provider(&state);
     *state.hotkey_statuses.borrow_mut() = statuses;
+
+    if recovered {
+        send_notification(
+            app,
+            "db-recovered",
+            "PasteFlow Database Recovered",
+            "Detected a corrupted database and restored from the latest backup.",
+        );
+    }
+    arm_next_expiry_timer(&state);
 
     if let Some(fd) = engine_fd {
         let st_fd = Rc::clone(&state);
@@ -393,32 +410,8 @@ fn pump_x11_events(state: &Rc<AppState>) {
     for ev in events {
         match ev {
             ClipboardEvent::Captured(raw) => {
-                let res = state.store.borrow_mut().insert_raw_clip(&raw, &cfg);
-                match res {
-                    Ok(InsertOutcome::Inserted(rec)) => {
-                        info!(
-                            id = rec.id,
-                            kind = rec.kind.as_str(),
-                            bytes = rec.byte_size,
-                            hash = %rec.short_hash(),
-                            "captured clip"
-                        );
-                        if state.queue.borrow().universal_paste {
-                            let _ = state.store.borrow_mut().queue_enqueue(rec.id);
-                            sync_queue_indicators(state);
-                        }
-                        store_changed = true;
-                    }
-                    Ok(InsertOutcome::Deduplicated(rec)) => {
-                        info!(id = rec.id, copy_count = rec.copy_count, "deduplicated clip");
-                        if state.queue.borrow().universal_paste {
-                            let _ = state.store.borrow_mut().queue_enqueue(rec.id);
-                            sync_queue_indicators(state);
-                        }
-                        store_changed = true;
-                    }
-                    Ok(InsertOutcome::Skipped(_)) => {}
-                    Err(e) => warn!(error = %e, "failed to store clip"),
+                if handle_captured_clip(state, &raw, &cfg) {
+                    store_changed = true;
                 }
             }
             ClipboardEvent::OwnerVanished { .. } => {}
@@ -491,6 +484,7 @@ fn ensure_main_window(state: &Rc<AppState>) {
     let win = MainWindow::new(
         &state.app,
         Rc::clone(&state.store),
+        Rc::clone(&state.ephemeral),
         state.paths.thumbs_dir(),
         paused,
         on_action,
@@ -680,12 +674,19 @@ fn handle_tray_command(state: &Rc<AppState>, cmd: TrayCommand) {
 }
 
 fn copy_clip_to_clipboard(state: &Rc<AppState>, id: i64) {
-    let formats = match state.store.borrow().get_clip_formats(id) {
-        Ok(f) if !f.is_empty() => f,
-        Ok(_) => return,
-        Err(e) => {
-            warn!(error = %e, id, "failed to load clip formats");
-            return;
+    let formats = if id < 0 {
+        match state.ephemeral.borrow().get_formats(id) {
+            Some(f) if !f.is_empty() => f,
+            _ => return,
+        }
+    } else {
+        match state.store.borrow().get_clip_formats(id) {
+            Ok(f) if !f.is_empty() => f,
+            Ok(_) => return,
+            Err(e) => {
+                warn!(error = %e, id, "failed to load clip formats");
+                return;
+            }
         }
     };
     if let Some(ref mut eng) = *state.engine.borrow_mut() {
@@ -701,7 +702,13 @@ fn handle_ui_action(state: &Rc<AppState>, action: UiAction) {
     match action {
         UiAction::CopyClip(id) => copy_clip_to_clipboard(state, id),
         UiAction::DeleteClip(id) => {
-            if let Err(e) = state.store.borrow_mut().delete_clip(id) {
+            if id < 0 {
+                if let Some(hash) = state.ephemeral.borrow_mut().delete(id)
+                    && let Some(ref mut eng) = *state.engine.borrow_mut()
+                {
+                    let _ = eng.clear_clipboard_if_hash_matches(&[hash]);
+                }
+            } else if let Err(e) = state.store.borrow_mut().delete_clip(id) {
                 warn!(error = %e, id, "failed to delete clip");
                 return;
             }
@@ -760,6 +767,9 @@ fn handle_ui_action(state: &Rc<AppState>, action: UiAction) {
                 .borrow_mut()
                 .update_clip_meta(clip_id, meta.as_deref());
             refresh_open_views(state);
+        }
+        UiAction::SetExpiry { clip_id, secs } => {
+            set_clip_expiry(state, clip_id, secs);
         }
         UiAction::AddToQueue(clip_id) => {
             if state.store.borrow_mut().queue_enqueue(clip_id).is_ok() {
@@ -1129,4 +1139,165 @@ pub fn send_notification(app: &Application, id: &str, title: &str, body: &str) {
     let notif = gio::Notification::new(title);
     notif.set_body(Some(body));
     app.send_notification(Some(id), &notif);
+}
+
+fn handle_captured_clip(state: &Rc<AppState>, raw: &RawClip, cfg: &Config) -> bool {
+    // Check for secret-looking text or short default expiry (≤ 1 h -> memory-only RAM store, Q3)
+    let primary_text = raw
+        .formats
+        .iter()
+        .find(|f| {
+            matches!(
+                f.mime.as_str(),
+                "UTF8_STRING" | "text/plain;charset=utf-8" | "text/plain" | "STRING"
+            )
+        })
+        .map(|f| String::from_utf8_lossy(&f.data).into_owned());
+
+    let is_secret = cfg.detect_secrets
+        && primary_text
+            .as_deref()
+            .and_then(pf_core::detect::secret::detect_secret)
+            .is_some();
+
+    if EphemeralStore::should_be_ephemeral(is_secret, cfg.default_expiry_secs) {
+        let secs = if is_secret {
+            cfg.secret_expiry_secs
+        } else {
+            cfg.default_expiry_secs.unwrap_or(60)
+        };
+        let exp = EphemeralStore::default_expiry_ms_from_now(secs);
+        let rec = state.ephemeral.borrow_mut().insert_raw(
+            raw,
+            ClipKind::Text,
+            primary_text.as_deref(),
+            is_secret,
+            exp,
+        );
+        info!(
+            id = rec.id,
+            is_secret,
+            expiry_secs = secs,
+            "stored sensitive/ephemeral clip in RAM only"
+        );
+        arm_next_expiry_timer(state);
+        return true;
+    }
+
+    match state.store.borrow_mut().insert_raw_clip(raw, cfg) {
+        Ok(InsertOutcome::Inserted(rec)) => {
+            info!(
+                id = rec.id,
+                kind = rec.kind.as_str(),
+                bytes = rec.byte_size,
+                hash = %rec.short_hash(),
+                "captured clip"
+            );
+            if let Some(secs) = cfg.default_expiry_secs {
+                let exp = EphemeralStore::default_expiry_ms_from_now(secs);
+                let _ = state.store.borrow_mut().set_clip_expiry(rec.id, Some(exp));
+                arm_next_expiry_timer(state);
+            }
+            if state.queue.borrow().universal_paste {
+                let _ = state.store.borrow_mut().queue_enqueue(rec.id);
+                sync_queue_indicators(state);
+            }
+            true
+        }
+        Ok(InsertOutcome::Deduplicated(rec)) => {
+            info!(id = rec.id, copy_count = rec.copy_count, "deduplicated clip");
+            if state.queue.borrow().universal_paste {
+                let _ = state.store.borrow_mut().queue_enqueue(rec.id);
+                sync_queue_indicators(state);
+            }
+            true
+        }
+        Ok(InsertOutcome::Skipped(_)) => false,
+        Err(e) => {
+            warn!(error = %e, "failed to store clip");
+            false
+        }
+    }
+}
+
+fn set_clip_expiry(state: &Rc<AppState>, clip_id: i64, secs: Option<u64>) {
+    if clip_id < 0 {
+        return;
+    }
+    match secs {
+        None => {
+            let _ = state.store.borrow_mut().set_clip_expiry(clip_id, None);
+        }
+        Some(s) if EphemeralStore::should_be_ephemeral(false, Some(s)) => {
+            // Q3: clips with expiry ≤ 1 h move to RAM-only ephemeral store and are removed from disk
+            let clip_opt = state.store.borrow().get_clip(clip_id).ok().flatten();
+            let formats = state.store.borrow().get_clip_formats(clip_id).unwrap_or_default();
+            if let Some(clip) = clip_opt
+                && !formats.is_empty()
+            {
+                let raw = RawClip {
+                    selection: clip.selection,
+                    formats,
+                    source_app: clip.source_app.clone(),
+                    owner_pid: None,
+                    captured_at_ms: clip.last_used_at,
+                };
+                let exp = EphemeralStore::default_expiry_ms_from_now(s);
+                state.ephemeral.borrow_mut().insert_raw(
+                    &raw,
+                    clip.kind,
+                    Some(&clip.preview),
+                    false,
+                    exp,
+                );
+                let _ = state.store.borrow_mut().delete_clip(clip_id);
+            }
+        }
+        Some(s) => {
+            let exp = EphemeralStore::default_expiry_ms_from_now(s);
+            let _ = state.store.borrow_mut().set_clip_expiry(clip_id, Some(exp));
+        }
+    }
+    arm_next_expiry_timer(state);
+    refresh_open_views(state);
+}
+
+/// Arm a single one-shot GLib timer for the earliest pending expiry across RAM and SQLite.
+/// Zero wakeups when no clip has an expiry timer!
+fn arm_next_expiry_timer(state: &Rc<AppState>) {
+    let eph_next = state.ephemeral.borrow().next_expiry_ms();
+    let db_next = state.store.borrow().next_expiry_ms().ok().flatten();
+    let earliest = match (eph_next, db_next) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    let Some(target_ms) = earliest else {
+        return;
+    };
+
+    let delay_ms = (target_ms - now_unix_ms()).max(50) as u64;
+    let gen_id = state.expiry_timer_gen.get().wrapping_add(1);
+    state.expiry_timer_gen.set(gen_id);
+
+    let st_c = Rc::clone(state);
+    glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
+        if st_c.expiry_timer_gen.get() != gen_id {
+            return;
+        }
+        let now = now_unix_ms();
+        let mut expired_hashes = st_c.ephemeral.borrow_mut().purge_expired(now);
+        if let Ok(db_hashes) = st_c.store.borrow_mut().purge_expired_clips(now) {
+            expired_hashes.extend(db_hashes);
+        }
+        if !expired_hashes.is_empty() {
+            info!(count = expired_hashes.len(), "purged expired clips");
+            if let Some(ref mut eng) = *st_c.engine.borrow_mut() {
+                let _ = eng.clear_clipboard_if_hash_matches(&expired_hashes);
+            }
+            refresh_open_views(&st_c);
+        }
+        arm_next_expiry_timer(&st_c);
+    });
 }

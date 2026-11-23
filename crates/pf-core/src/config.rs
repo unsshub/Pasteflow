@@ -200,6 +200,9 @@ pub struct Config {
     pub use_cinnamon_keybindings: bool,
     pub overlay_at_pointer: bool,
     pub terminal_paste_classes: Vec<String>,
+    pub detect_secrets: bool,
+    pub secret_expiry_secs: u64,
+    pub default_expiry_secs: Option<u64>,
 }
 
 impl Default for Config {
@@ -234,6 +237,9 @@ impl Default for Config {
                 "xterm".to_string(),
                 "konsole".to_string(),
             ],
+            detect_secrets: true,
+            secret_expiry_secs: 30,
+            default_expiry_secs: None,
         }
     }
 }

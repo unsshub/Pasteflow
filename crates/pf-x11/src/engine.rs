@@ -23,6 +23,8 @@ const INCR_CHUNK: usize = 256 * 1024;
 const STEP_TIMEOUT: Duration = Duration::from_secs(1);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 const EMPTY_GUARD_DELAY: Duration = Duration::from_millis(300);
+const PRIMARY_DEBOUNCE_DELAY: Duration = Duration::from_millis(750);
+const PRIMARY_MIN_CHARS: usize = 3;
 
 struct Atoms {
     clipboard: xproto::Atom,
@@ -115,6 +117,7 @@ pub struct X11Engine {
     last_captured_formats: Option<Vec<RawFormat>>,
     pending_incrs: HashMap<(xproto::Window, xproto::Atom), PendingIncr>,
     empty_guard_deadline: Option<Instant>,
+    primary_pending: Option<(Instant, xproto::Window)>,
     atom_name_cache: HashMap<xproto::Atom, String>,
     hotkeys: HotkeyManager,
 }
@@ -183,9 +186,36 @@ impl X11Engine {
             last_captured_formats: None,
             pending_incrs: HashMap::new(),
             empty_guard_deadline: None,
+            primary_pending: None,
             atom_name_cache: HashMap::new(),
             hotkeys: HotkeyManager::default(),
         })
+    }
+
+    /// If PasteFlow currently owns `CLIPBOARD` and its payload matches any hash in `expired_hashes`,
+    /// immediately release ownership (`SetSelectionOwner(NONE)`) so the expired secret is wiped
+    /// from the system clipboard (§17).
+    pub fn clear_clipboard_if_hash_matches(&mut self, expired_hashes: &[[u8; 32]]) -> Result<bool> {
+        if expired_hashes.is_empty() {
+            return Ok(false);
+        }
+        let matches = self.served_formats.iter().any(|f| {
+            let h_text = pf_core::model::canonical_hash(pf_core::model::ClipKind::Text, &f.data);
+            let h_img = pf_core::model::canonical_hash(pf_core::model::ClipKind::Image, &f.data);
+            expired_hashes.contains(&h_text) || expired_hashes.contains(&h_img)
+        });
+        if self.owns_clipboard && matches {
+            let ts = self.get_server_timestamp()?;
+            self.conn
+                .set_selection_owner(x11rb::NONE, self.atoms.clipboard, ts)?;
+            self.conn.flush()?;
+            self.owns_clipboard = false;
+            self.served_formats.clear();
+            self.last_captured_formats = None;
+            info!("cleared expired clip from X11 CLIPBOARD");
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Register global X11 key grabs for the configured shortcuts.
@@ -271,10 +301,16 @@ impl X11Engine {
         self.owns_clipboard
     }
 
-    /// Milliseconds until the next internal timer (e.g. empty-clipboard guard),
+    /// Milliseconds until the next internal timer (empty-clipboard guard or PRIMARY debounce),
     /// or `-1` if no timer is armed (allowing infinite sleep in `poll(2)`).
     pub fn next_timeout_ms(&self) -> i32 {
-        match self.empty_guard_deadline {
+        let earliest = match (self.empty_guard_deadline, self.primary_pending.map(|(t, _)| t)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        match earliest {
             Some(deadline) => {
                 let rem = deadline.saturating_duration_since(Instant::now());
                 i32::try_from(rem.as_millis().max(1)).unwrap_or(1000)
@@ -942,6 +978,42 @@ impl X11Engine {
         }
         Ok(())
     }
+
+    fn check_primary_debounce(&mut self) -> Result<Option<RawClip>> {
+        let Some((deadline, owner)) = self.primary_pending else {
+            return Ok(None);
+        };
+        if Instant::now() < deadline {
+            return Ok(None);
+        }
+        // Defer if any mouse button is still held down (§7.4)
+        if let Ok(qp) = self.conn.query_pointer(self.root).and_then(|c| Ok(c.reply()))
+            && let Ok(reply) = qp
+        {
+            let buttons = u16::from(reply.mask) & 0x1f00; // Button1..Button5 masks
+            if buttons != 0 {
+                self.primary_pending = Some((Instant::now() + Duration::from_millis(250), owner));
+                return Ok(None);
+            }
+        }
+        self.primary_pending = None;
+        if self.paused || !self.config.capture_primary {
+            return Ok(None);
+        }
+        let Some(raw) = self.capture_selection(self.atoms.primary, owner)? else {
+            return Ok(None);
+        };
+        // Minimum 3 characters for PRIMARY (§7.4)
+        let char_count = raw
+            .formats
+            .first()
+            .map(|f| String::from_utf8_lossy(&f.data).trim().chars().count())
+            .unwrap_or(0);
+        if char_count < PRIMARY_MIN_CHARS {
+            return Ok(None);
+        }
+        Ok(Some(raw))
+    }
 }
 
 impl ClipboardBackend for X11Engine {
@@ -989,6 +1061,12 @@ impl ClipboardBackend for X11Engine {
                         continue;
                     }
 
+                    if selection_kind == SelectionKind::Primary {
+                        // Debounce PRIMARY captures by 750 ms (§7.4) so mouse dragging doesn't flood history
+                        self.primary_pending = Some((Instant::now() + PRIMARY_DEBOUNCE_DELAY, sev.owner));
+                        continue;
+                    }
+
                     match self.capture_selection(sev.selection, sev.owner) {
                         Ok(Some(raw)) => emitted.push(ClipboardEvent::Captured(raw)),
                         Ok(None) => {}
@@ -1014,6 +1092,9 @@ impl ClipboardBackend for X11Engine {
         }
 
         self.check_empty_guard()?;
+        if let Some(raw) = self.check_primary_debounce()? {
+            emitted.push(ClipboardEvent::Captured(raw));
+        }
         Ok(emitted)
     }
 

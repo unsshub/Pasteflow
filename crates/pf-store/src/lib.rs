@@ -1,6 +1,9 @@
 //! Local SQLite (WAL + FTS5) and content-addressed blob storage for PasteFlow.
 
 pub mod blobs;
+pub mod ephemeral;
+
+pub use ephemeral::EphemeralStore;
 
 use anyhow::{Context, Result, bail};
 use blobs::BlobStore;
@@ -30,25 +33,50 @@ pub enum InsertOutcome {
 pub struct Store {
     conn: Connection,
     blobs: BlobStore,
+    backups_dir: Option<std::path::PathBuf>,
+    recovered_from_corruption: bool,
 }
 
 impl Store {
     /// Open (or create) the persistent PasteFlow database and blob/thumbnail directories.
     pub fn open(paths: &AppPaths) -> Result<Self> {
         paths.ensure_dirs()?;
-        Self::open_at(&paths.db_file(), paths.blobs_dir(), paths.thumbs_dir())
+        let mut store = Self::open_at(&paths.db_file(), paths.blobs_dir(), paths.thumbs_dir())?;
+        store.backups_dir = Some(paths.backups_dir());
+        Ok(store)
     }
 
     /// Open at explicit paths (useful for tests and isolated environments).
+    /// If the database fails `PRAGMA quick_check` (corruption), renames the corrupt file
+    /// to `.corrupt-<ts>`, restores the newest backup if available, or creates a fresh DB.
     pub fn open_at(
         db_path: &Path,
         blobs_dir: std::path::PathBuf,
         thumbs_dir: std::path::PathBuf,
     ) -> Result<Self> {
+        let backups_dir = db_path.parent().map(|p| p.join("backups"));
         if let Some(parent) = db_path.parent() {
             pf_core::config::create_private_dir(parent)?;
         }
         let blobs = BlobStore::new(blobs_dir, thumbs_dir)?;
+
+        match Self::try_open_and_verify(db_path, blobs.clone(), backups_dir.clone()) {
+            Ok(store) => Ok(store),
+            Err(err) => {
+                warn!(error = %err, db = %db_path.display(), "database corruption detected; recovering");
+                recover_corrupt_db(db_path, backups_dir.as_deref())?;
+                let mut store = Self::try_open_and_verify(db_path, blobs, backups_dir)?;
+                store.recovered_from_corruption = true;
+                Ok(store)
+            }
+        }
+    }
+
+    fn try_open_and_verify(
+        db_path: &Path,
+        blobs: BlobStore,
+        backups_dir: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
         let conn = Connection::open(db_path)
             .with_context(|| format!("open sqlite db {}", db_path.display()))?;
 
@@ -58,11 +86,20 @@ impl Store {
             let _ = std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600));
         }
 
-        let store = Self { conn, blobs };
+        let store = Self {
+            conn,
+            blobs,
+            backups_dir,
+            recovered_from_corruption: false,
+        };
         store.configure_pragmas()?;
         store.check_integrity()?;
         store.run_migrations()?;
         Ok(store)
+    }
+
+    pub fn recovered_from_corruption(&self) -> bool {
+        self.recovered_from_corruption
     }
 
     fn configure_pragmas(&self) -> Result<()> {
@@ -633,7 +670,118 @@ impl Store {
 
         self.cleanup_unreferenced_files(&blob_keys, &thumb_keys)?;
         self.wal_checkpoint_truncate()?;
+        // §17: "Clear history" also deletes rotating backups
+        if let Some(ref bdir) = self.backups_dir {
+            let _ = delete_all_backups(bdir);
+        }
         Ok(deleted)
+    }
+
+    /// Clear unpinned clips older than `cutoff_ms` (Unix ms).
+    pub fn clear_older_than(&mut self, cutoff_ms: i64) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM clips WHERE pinned = 0 AND last_used_at < ?1",
+            )?;
+            let rows = stmt.query_map(params![cutoff_ms], |r| r.get(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let (blob_keys, thumb_keys) = collect_clip_files_tx(&tx, &ids)?;
+        let deleted = tx.execute(
+            "DELETE FROM clips WHERE pinned = 0 AND last_used_at < ?1",
+            params![cutoff_ms],
+        )?;
+        tx.commit()?;
+        self.cleanup_unreferenced_files(&blob_keys, &thumb_keys)?;
+        self.wal_checkpoint_truncate()?;
+        Ok(deleted)
+    }
+
+    /// Set or clear a persistent expiry timestamp (Unix ms) on a clip.
+    pub fn set_clip_expiry(&mut self, id: i64, expires_at_ms: Option<i64>) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE clips SET expires_at = ?1 WHERE id = ?2",
+            params![expires_at_ms, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Return the earliest `expires_at` timestamp (Unix ms) among unpinned persistent clips.
+    pub fn next_expiry_ms(&self) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT MIN(expires_at) FROM clips WHERE expires_at IS NOT NULL AND pinned = 0",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Purge all unpinned persistent clips whose `expires_at <= now_ms`, remove blobs,
+    /// truncate WAL, and return their `content_hash`es.
+    pub fn purge_expired_clips(&mut self, now_ms: i64) -> Result<Vec<[u8; 32]>> {
+        let tx = self.conn.transaction()?;
+        let expired: Vec<(i64, Vec<u8>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, content_hash FROM clips
+                 WHERE expires_at IS NOT NULL AND expires_at <= ?1 AND pinned = 0",
+            )?;
+            let rows = stmt.query_map(params![now_ms], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if expired.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = expired.iter().map(|(id, _)| *id).collect();
+        let (blob_keys, thumb_keys) = collect_clip_files_tx(&tx, &ids)?;
+        for id in &ids {
+            tx.execute("DELETE FROM clips WHERE id = ?1", params![id])?;
+        }
+        tx.commit()?;
+
+        self.cleanup_unreferenced_files(&blob_keys, &thumb_keys)?;
+        self.wal_checkpoint_truncate()?;
+
+        let hashes = expired
+            .into_iter()
+            .filter_map(|(_, h)| {
+                if h.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&h);
+                    Some(arr)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Ok(hashes)
+    }
+
+    /// Create a consistent `VACUUM INTO` snapshot in `backups_dir` and rotate to keep
+    /// at most `max_keep` (default 3) snapshots.
+    pub fn backup_now(&self, max_keep: usize) -> Result<std::path::PathBuf> {
+        let bdir = self
+            .backups_dir
+            .as_ref()
+            .context("backups_dir not configured")?;
+        pf_core::config::create_private_dir(bdir)?;
+        let ts = now_unix_ms();
+        let dest = bdir.join(format!("pasteflow-{ts}.db"));
+        let dest_str = dest.to_string_lossy().replace('\'', "''");
+        self.conn
+            .execute_batch(&format!("VACUUM INTO '{dest_str}';"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600));
+        }
+        rotate_backups(bdir, max_keep)?;
+        info!(path = %dest.display(), "created database backup snapshot");
+        Ok(dest)
     }
 
     /// List all Paste Queue items in FIFO order (`ord ASC`).
@@ -1087,6 +1235,78 @@ fn renumber_queue_tx(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn rotate_backups(bdir: &Path, max_keep: usize) -> Result<()> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(bdir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("pasteflow-") && n.ends_with(".db"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    while files.len() > max_keep {
+        let oldest = files.remove(0);
+        let _ = std::fs::remove_file(oldest);
+    }
+    Ok(())
+}
+
+fn delete_all_backups(bdir: &Path) -> Result<()> {
+    if !bdir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(bdir)?.flatten() {
+        let p = entry.path();
+        if p.is_file() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+    Ok(())
+}
+
+fn recover_corrupt_db(db_path: &Path, backups_dir: Option<&Path>) -> Result<()> {
+    let ts = now_unix_ms();
+    if db_path.exists() {
+        let corrupt_path = db_path.with_extension(format!("db.corrupt-{ts}"));
+        let _ = std::fs::rename(db_path, &corrupt_path);
+    }
+    // Remove stale WAL/SHM sidecars for the corrupt file
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = std::path::PathBuf::from(format!("{}{suffix}", db_path.display()));
+        if sidecar.exists() {
+            let _ = std::fs::remove_file(sidecar);
+        }
+    }
+
+    // Restore newest backup if present
+    if let Some(bdir) = backups_dir
+        && bdir.exists()
+    {
+        let mut backups: Vec<std::path::PathBuf> = std::fs::read_dir(bdir)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("pasteflow-") && n.ends_with(".db"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        backups.sort();
+        if let Some(newest) = backups.last() {
+            std::fs::copy(newest, db_path)
+                .with_context(|| format!("restore backup {}", newest.display()))?;
+            info!(backup = %newest.display(), "restored database from latest backup");
+        }
+    }
+    Ok(())
+}
+
 fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
@@ -1381,6 +1601,63 @@ mod tests {
         assert!(store.delete_space(sp.id, false).unwrap());
         let moved = store.get_clip(c1).unwrap().unwrap();
         assert_eq!(moved.space_id, def_id);
+    }
+
+    #[test]
+    fn backup_rotation_and_corruption_recovery() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("pasteflow.db");
+        let blobs_dir = dir.path().join("blobs");
+        let thumbs_dir = dir.path().join("thumbs");
+        let cfg = Config::default();
+
+        {
+            let mut store = Store::open_at(&db_path, blobs_dir.clone(), thumbs_dir.clone()).unwrap();
+            store
+                .insert_raw_clip(&raw_text("important backup clip", 1000), &cfg)
+                .unwrap();
+            let _b1 = store.backup_now(3).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let _b2 = store.backup_now(3).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let _b3 = store.backup_now(3).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let _b4 = store.backup_now(3).unwrap();
+            let count = std::fs::read_dir(dir.path().join("backups")).unwrap().count();
+            assert_eq!(count, 3, "should rotate keeping latest 3 backups");
+        }
+
+        // Corrupt the DB file by overwriting with garbage
+        std::fs::write(&db_path, b"THIS IS CORRUPT SQLITE GARBAGE").unwrap();
+
+        let recovered = Store::open_at(&db_path, blobs_dir, thumbs_dir).unwrap();
+        assert!(recovered.recovered_from_corruption());
+        let clips = recovered.list_clips(&ClipFilter::recent(10)).unwrap();
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].preview, "important backup clip");
+    }
+
+    #[test]
+    fn persistent_expiry_purges_unpinned_and_protects_pinned() {
+        let (_dir, mut store) = test_store();
+        let cfg = Config::default();
+        let c1 = match store.insert_raw_clip(&raw_text("temp 2h clip", 100), &cfg).unwrap() {
+            InsertOutcome::Inserted(c) => c.id,
+            _ => unreachable!(),
+        };
+        let c2 = match store.insert_raw_clip(&raw_text("pinned clip", 200), &cfg).unwrap() {
+            InsertOutcome::Inserted(c) => c.id,
+            _ => unreachable!(),
+        };
+        store.set_clip_expiry(c1, Some(5000)).unwrap();
+        store.set_clip_expiry(c2, Some(5000)).unwrap();
+        store.set_pinned(c2, true).unwrap();
+
+        assert_eq!(store.next_expiry_ms().unwrap(), Some(5000));
+        let purged = store.purge_expired_clips(5000).unwrap();
+        assert_eq!(purged.len(), 1);
+        assert!(store.get_clip(c1).unwrap().is_none());
+        assert!(store.get_clip(c2).unwrap().is_some());
     }
 
     fn walk_files(dir: &Path) -> usize {

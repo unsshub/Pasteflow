@@ -32,6 +32,17 @@ const LANG_OPTIONS: &[(&str, &str)] = &[
     ("XML", "xml"),
 ];
 
+const EXPIRY_PRESETS: &[(&str, Option<u64>)] = &[
+    ("Expire: Never", None),
+    ("15 s", Some(15)),
+    ("30 s", Some(30)),
+    ("1 min", Some(60)),
+    ("5 min", Some(300)),
+    ("15 min", Some(900)),
+    ("1 hour", Some(3_600)),
+    ("24 hours", Some(86_400)),
+];
+
 #[derive(Debug, Clone)]
 pub enum DetailAction {
     CopyText(String),
@@ -40,6 +51,7 @@ pub enum DetailAction {
     OpenImageInViewer(i64),
     OpenUrl(String),
     SetLanguage { clip_id: i64, lang: String },
+    SetExpiry { clip_id: i64, secs: Option<u64> },
 }
 
 pub struct DetailPanel {
@@ -107,6 +119,29 @@ impl DetailPanel {
             });
         }
         header.append(&lang_dropdown);
+
+        let expiry_names: Vec<&str> = EXPIRY_PRESETS.iter().map(|(n, _)| *n).collect();
+        let expiry_dd = DropDown::new(Some(StringList::new(&expiry_names)), gtk4::Expression::NONE);
+        expiry_dd.set_tooltip_text(Some("Auto-expire clip (≤ 1 h stored in RAM only)"));
+        {
+            let id_c = Rc::clone(&current_clip_id);
+            let sup_c = Rc::clone(&suppress_lang_signal);
+            let act_c = Rc::clone(&on_action);
+            expiry_dd.connect_selected_notify(move |dd| {
+                if sup_c.get() {
+                    return;
+                }
+                if let Some(clip_id) = id_c.get()
+                    && let Some((_, secs)) = EXPIRY_PRESETS.get(dd.selected() as usize)
+                {
+                    act_c(DetailAction::SetExpiry {
+                        clip_id,
+                        secs: *secs,
+                    });
+                }
+            });
+        }
+        header.append(&expiry_dd);
 
         let copy_clip_btn = Button::builder()
             .icon_name("edit-copy-symbolic")

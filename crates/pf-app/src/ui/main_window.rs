@@ -11,7 +11,7 @@ use gtk4::{
     Stack, ToggleButton, gdk, pango,
 };
 use pf_core::model::{ClipFilter, ClipKind, ClipRecord, now_unix_ms};
-use pf_store::Store;
+use pf_store::{EphemeralStore, Store};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -30,6 +30,7 @@ pub enum UiAction {
     OpenImageInViewer(i64),
     OpenUrl(String),
     SetLanguage { clip_id: i64, lang: String },
+    SetExpiry { clip_id: i64, secs: Option<u64> },
     AddToQueue(i64),
     Queue(QueueUiAction),
     ToggleUniversalPasteShortcut,
@@ -65,6 +66,7 @@ pub struct MainWindow {
     status_label: Label,
     nav_state: Rc<RefCell<NavSelection>>,
     store: Rc<RefCell<Store>>,
+    ephemeral: Rc<RefCell<EphemeralStore>>,
     on_action: Rc<dyn Fn(UiAction)>,
 }
 
@@ -72,6 +74,7 @@ impl MainWindow {
     pub fn new(
         app: &Application,
         store: Rc<RefCell<Store>>,
+        ephemeral: Rc<RefCell<EphemeralStore>>,
         thumbs_dir: PathBuf,
         initial_paused: bool,
         on_action: Rc<dyn Fn(UiAction)>,
@@ -352,6 +355,9 @@ impl MainWindow {
                 DetailAction::SetLanguage { clip_id, lang } => {
                     act(UiAction::SetLanguage { clip_id, lang })
                 }
+                DetailAction::SetExpiry { clip_id, secs } => {
+                    act(UiAction::SetExpiry { clip_id, secs })
+                }
             })
         };
         let detail_panel = Rc::new(DetailPanel::new(Rc::clone(&store), on_detail_action));
@@ -431,6 +437,7 @@ impl MainWindow {
             status_label,
             nav_state,
             store,
+            ephemeral,
             on_action: Rc::clone(&on_action),
         };
 
@@ -461,9 +468,11 @@ impl MainWindow {
             let status_c = main_win.status_label.clone();
             let nav_c = Rc::clone(&main_win.nav_state);
             let store_c = Rc::clone(&main_win.store);
+            let eph_c = Rc::clone(&main_win.ephemeral);
             main_win.search_entry.connect_search_changed(move |entry| {
                 reload_list(
                     &store_c.borrow(),
+                    &eph_c.borrow(),
                     &model_c,
                     &stack_c,
                     &status_c,
@@ -480,6 +489,7 @@ impl MainWindow {
             let status_c = main_win.status_label.clone();
             let nav_c = Rc::clone(&main_win.nav_state);
             let store_c = Rc::clone(&main_win.store);
+            let eph_c = Rc::clone(&main_win.ephemeral);
             let search_c = main_win.search_entry.clone();
             let qv_c = Rc::clone(&main_win.queue_view);
             let mstack_c = main_stack.clone();
@@ -501,6 +511,7 @@ impl MainWindow {
                         mstack_c.set_visible_child_name("clips");
                         reload_list(
                             &store_c.borrow(),
+                            &eph_c.borrow(),
                             &model_c,
                             &stack_c,
                             &status_c,
@@ -519,6 +530,7 @@ impl MainWindow {
             let status_c = main_win.status_label.clone();
             let nav_c = Rc::clone(&main_win.nav_state);
             let store_c = Rc::clone(&main_win.store);
+            let eph_c = Rc::clone(&main_win.ephemeral);
             let search_c = main_win.search_entry.clone();
             let mstack_c = main_stack.clone();
             let nav_list_c = nav_list.clone();
@@ -538,6 +550,7 @@ impl MainWindow {
                     mstack_c.set_visible_child_name("clips");
                     reload_list(
                         &store_c.borrow(),
+                        &eph_c.borrow(),
                         &model_c,
                         &stack_c,
                         &status_c,
@@ -654,6 +667,7 @@ impl MainWindow {
         self.reload_spaces_sidebar();
         reload_list(
             &self.store.borrow(),
+            &self.ephemeral.borrow(),
             &self.model,
             &self.stack,
             &self.status_label,
@@ -747,6 +761,7 @@ fn selected_clip_id(selection: &SingleSelection) -> Option<i64> {
 
 fn reload_list(
     store: &Store,
+    ephemeral: &EphemeralStore,
     model: &gio::ListStore,
     stack: &Stack,
     status_label: &Label,
@@ -767,7 +782,12 @@ fn reload_list(
         offset: 0,
     };
 
-    let clips = store.list_clips(&filter).unwrap_or_default();
+    let mut clips = Vec::new();
+    // Prepend memory-only ephemeral clips in All Clips view when no search query is active
+    if !nav.pinned_only && nav.space_id.is_none() && nav.kind.is_none() && nav.kinds.is_empty() && query.trim().is_empty() {
+        clips.extend(ephemeral.list());
+    }
+    clips.extend(store.list_clips(&filter).unwrap_or_default());
     let count = clips.len();
     let objects: Vec<glib::BoxedAnyObject> = clips
         .into_iter()
@@ -991,6 +1011,19 @@ fn build_row_factory(
         }
         if clip.copy_count > 1 {
             meta_parts.push(format!("×{}", clip.copy_count));
+        }
+        if let Some(exp) = clip.expires_at {
+            let rem_s = ((exp - now_unix_ms()).max(0) + 999) / 1000;
+            if rem_s < 60 {
+                meta_parts.push(format!("⏱ {rem_s}s"));
+            } else if rem_s < 3600 {
+                meta_parts.push(format!("⏱ {}m", rem_s / 60));
+            } else {
+                meta_parts.push(format!("⏱ {}h", rem_s / 3600));
+            }
+        }
+        if clip.id < 0 {
+            meta_parts.push("RAM-only".to_string());
         }
         w.meta.set_text(&meta_parts.join(" · "));
 
