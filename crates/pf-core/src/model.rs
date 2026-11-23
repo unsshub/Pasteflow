@@ -170,6 +170,7 @@ pub struct SpaceRecord {
 pub struct ClipFilter {
     pub query: Option<String>,
     pub kind: Option<ClipKind>,
+    pub kinds: Vec<ClipKind>,
     pub space_id: Option<i64>,
     pub pinned_only: bool,
     pub limit: usize,

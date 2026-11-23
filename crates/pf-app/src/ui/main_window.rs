@@ -1,11 +1,13 @@
+use crate::ui::detail::{DetailAction, DetailPanel};
 use crate::ui::{format_bytes, format_relative_time};
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, Image, Label,
-    ListBox, ListBoxRow, ListItem, ListView, Orientation, PolicyType, ScrolledWindow, SearchEntry,
-    Separator, SignalListItemFactory, SingleSelection, Stack, ToggleButton, gdk, pango,
+    ListBox, ListBoxRow, ListItem, ListView, Orientation, Paned, PolicyType, ScrolledWindow,
+    SearchEntry, Separator, SignalListItemFactory, SingleSelection, Stack, ToggleButton, gdk,
+    pango,
 };
 use pf_core::model::{ClipFilter, ClipKind, ClipRecord, now_unix_ms};
 use pf_store::Store;
@@ -17,17 +19,23 @@ use std::rc::Rc;
 #[derive(Debug, Clone)]
 pub enum UiAction {
     CopyClip(i64),
+    CopyText(String),
     DeleteClip(i64),
     TogglePin(i64),
     TogglePause,
     ClearUnpinned,
     OpenShortcuts,
+    SaveImageToDownloads(i64),
+    OpenImageInViewer(i64),
+    OpenUrl(String),
+    SetLanguage { clip_id: i64, lang: String },
 }
 
 #[derive(Debug, Clone, Default)]
 struct NavSelection {
     pinned_only: bool,
     kind: Option<ClipKind>,
+    kinds: Vec<ClipKind>,
     space_id: Option<i64>,
 }
 
@@ -139,6 +147,7 @@ impl MainWindow {
             ("applications-graphics-symbolic", "Colors", ClipKind::Color),
             ("image-x-generic-symbolic", "Images", ClipKind::Image),
             ("folder-documents-symbolic", "Files", ClipKind::Files),
+            ("accessories-calculator-symbolic", "Numbers", ClipKind::Number),
         ] {
             add_nav_row(
                 &nav_list,
@@ -151,6 +160,16 @@ impl MainWindow {
                 },
             );
         }
+        add_nav_row(
+            &nav_list,
+            &mut nav_targets,
+            "contact-new-symbolic",
+            "Contacts",
+            NavSelection {
+                kinds: vec![ClipKind::Email, ClipKind::Phone],
+                ..Default::default()
+            },
+        );
 
         add_section_header(&nav_list, &mut nav_targets, "SPACES");
         if let Ok(spaces) = store.borrow().list_spaces() {
@@ -215,6 +234,13 @@ impl MainWindow {
             .build();
         toolbar.append(&shortcuts_btn);
 
+        let detail_toggle_btn = ToggleButton::builder()
+            .icon_name("sidebar-show-right-symbolic")
+            .tooltip_text("Toggle detail panel (F9)")
+            .active(true)
+            .build();
+        toolbar.append(&detail_toggle_btn);
+
         content_vbox.append(&toolbar);
 
         let paused_banner = Label::new(Some("Clipboard capture is paused"));
@@ -261,7 +287,56 @@ impl MainWindow {
         stack.set_hexpand(true);
         stack.add_named(&scrolled, Some("list"));
         stack.add_named(&empty_label, Some("empty"));
-        content_vbox.append(&stack);
+
+        // Collapsible right-hand Detail Panel (`GtkPaned`, F9 toggle)
+        let on_detail_action: Rc<dyn Fn(DetailAction)> = {
+            let act = Rc::clone(&on_action);
+            Rc::new(move |da| match da {
+                DetailAction::CopyText(t) => act(UiAction::CopyText(t)),
+                DetailAction::CopyClip(id) => act(UiAction::CopyClip(id)),
+                DetailAction::SaveImageToDownloads(id) => act(UiAction::SaveImageToDownloads(id)),
+                DetailAction::OpenImageInViewer(id) => act(UiAction::OpenImageInViewer(id)),
+                DetailAction::OpenUrl(u) => act(UiAction::OpenUrl(u)),
+                DetailAction::SetLanguage { clip_id, lang } => {
+                    act(UiAction::SetLanguage { clip_id, lang })
+                }
+            })
+        };
+        let detail_panel = Rc::new(DetailPanel::new(Rc::clone(&store), on_detail_action));
+
+        let paned = Paned::new(Orientation::Horizontal);
+        paned.set_vexpand(true);
+        paned.set_hexpand(true);
+        paned.set_start_child(Some(&stack));
+        paned.set_end_child(Some(detail_panel.widget()));
+        paned.set_resize_start_child(true);
+        paned.set_resize_end_child(false);
+        paned.set_shrink_start_child(false);
+        paned.set_shrink_end_child(false);
+        paned.set_position(460);
+        content_vbox.append(&paned);
+
+        // Update detail panel whenever selection changes
+        {
+            let dp = Rc::clone(&detail_panel);
+            selection.connect_selected_item_notify(move |sel| {
+                if let Some(obj) = sel.selected_item()
+                    && let Ok(boxed) = obj.downcast::<glib::BoxedAnyObject>()
+                {
+                    dp.show_clip(&boxed.borrow::<ClipRecord>());
+                } else {
+                    dp.clear();
+                }
+            });
+        }
+
+        // Toggle detail panel visibility from toolbar button
+        {
+            let dp = Rc::clone(&detail_panel);
+            detail_toggle_btn.connect_toggled(move |btn| {
+                dp.widget().set_visible(btn.is_active());
+            });
+        }
 
         // Bottom status bar
         content_vbox.append(&Separator::new(Orientation::Horizontal));
@@ -366,9 +441,14 @@ impl MainWindow {
             let sel_c = main_win.selection.clone();
             let win_weak = main_win.window.downgrade();
             let act_c = Rc::clone(&on_action);
+            let dt_btn = detail_toggle_btn.clone();
 
             key_ctrl.connect_key_pressed(move |_ctrl, key, _code, mods| {
                 let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+                if key == gdk::Key::F9 {
+                    dt_btn.set_active(!dt_btn.is_active());
+                    return glib::Propagation::Stop;
+                }
                 if ctrl && (key == gdk::Key::f || key == gdk::Key::F) {
                     search_c.grab_focus();
                     return glib::Propagation::Stop;
@@ -464,6 +544,7 @@ fn reload_list(
             Some(query.to_string())
         },
         kind: nav.kind,
+        kinds: nav.kinds.clone(),
         space_id: nav.space_id,
         pinned_only: nav.pinned_only,
         limit: 200,

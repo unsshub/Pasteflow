@@ -23,12 +23,15 @@ gtk4 = { version = "0.11", features = ["v4_14"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp", "gif"] }
 ksni = { version = "0.3", features = ["blocking"] }
 libc = "0.2"
+regex = "1.11"
 rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sourceview5 = "0.11"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
 x11rb = { version = "0.14", features = ["xfixes", "xtest", "xkb"] }
 
 [profile.release]

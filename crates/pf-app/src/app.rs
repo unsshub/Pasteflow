@@ -2,6 +2,7 @@ use crate::autostart;
 use crate::cinnamon_keys;
 use crate::tray::{self, PasteFlowTray, TrayCommand};
 use crate::ui;
+use crate::ui::detail;
 use crate::ui::main_window::{MainWindow, UiAction};
 use crate::ui::overlay::{OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayAction, OverlayWindow};
 use crate::ui::shortcut_dialog::{ShortcutSettingsUpdate, show_shortcut_dialog};
@@ -710,6 +711,81 @@ fn handle_ui_action(state: &Rc<AppState>, action: UiAction) {
             Err(e) => warn!(error = %e, "failed to clear history"),
         },
         UiAction::OpenShortcuts => open_shortcuts_dialog(state),
+        UiAction::CopyText(text) => {
+            if let Some(ref mut eng) = *state.engine.borrow_mut() {
+                let _ = eng.own_clipboard(vec![pf_core::model::RawFormat {
+                    mime: "text/plain;charset=utf-8".to_string(),
+                    data: text.into_bytes(),
+                }]);
+            }
+        }
+        UiAction::SaveImageToDownloads(id) => save_image_to_downloads(state, id),
+        UiAction::OpenImageInViewer(id) => open_image_in_viewer(state, id),
+        UiAction::OpenUrl(url) => {
+            if let Err(e) = detail::launch_default_uri(&url) {
+                warn!(error = %e, "failed to open URL");
+            }
+        }
+        UiAction::SetLanguage { clip_id, lang } => {
+            let meta = if lang.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!({ "lang": lang }).to_string())
+            };
+            let _ = state
+                .store
+                .borrow_mut()
+                .update_clip_meta(clip_id, meta.as_deref());
+            refresh_open_views(state);
+        }
+    }
+}
+
+fn save_image_to_downloads(state: &Rc<AppState>, id: i64) {
+    let Ok(formats) = state.store.borrow().get_clip_formats(id) else {
+        return;
+    };
+    let Some(img) = formats.iter().find(|f| f.mime.starts_with("image/")) else {
+        return;
+    };
+    let ext = pf_store::blobs::mime_to_ext(&img.mime);
+    let downloads = directories::UserDirs::new()
+        .and_then(|u| u.download_dir().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| state.paths.data_dir.clone());
+    let _ = std::fs::create_dir_all(&downloads);
+    let filename = format!("pasteflow-{id}-{}.{ext}", pf_core::model::now_unix_ms() / 1000);
+    let dest = downloads.join(&filename);
+    match std::fs::write(&dest, &img.data) {
+        Ok(()) => {
+            info!(path = %dest.display(), "saved image to Downloads");
+            send_notification(
+                &state.app,
+                "save-image",
+                "Image Saved",
+                &format!("Saved to {}", dest.display()),
+            );
+        }
+        Err(e) => warn!(error = %e, "failed to save image to Downloads"),
+    }
+}
+
+fn open_image_in_viewer(state: &Rc<AppState>, id: i64) {
+    let Ok(formats) = state.store.borrow().get_clip_formats(id) else {
+        return;
+    };
+    let Some(img) = formats.iter().find(|f| f.mime.starts_with("image/")) else {
+        return;
+    };
+    let ext = pf_store::blobs::mime_to_ext(&img.mime);
+    let tmp = state
+        .paths
+        .cache_dir
+        .join(format!("preview-{id}.{ext}"));
+    if std::fs::write(&tmp, &img.data).is_ok() {
+        let uri = format!("file://{}", tmp.display());
+        if let Err(e) = detail::launch_default_uri(&uri) {
+            warn!(error = %e, "failed to open image in default viewer");
+        }
     }
 }
 

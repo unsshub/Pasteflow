@@ -404,6 +404,13 @@ impl Store {
         if let Some(kind) = filter.kind {
             params_vec.push(kind.as_str().to_string().into());
             conditions.push(format!("c.kind = ?{}", params_vec.len()));
+        } else if !filter.kinds.is_empty() {
+            let mut placeholders = Vec::with_capacity(filter.kinds.len());
+            for k in &filter.kinds {
+                params_vec.push(k.as_str().to_string().into());
+                placeholders.push(format!("?{}", params_vec.len()));
+            }
+            conditions.push(format!("c.kind IN ({})", placeholders.join(",")));
         }
         if let Some(space_id) = filter.space_id {
             params_vec.push(space_id.into());
@@ -449,6 +456,15 @@ impl Store {
         let changed = self.conn.execute(
             "UPDATE clips SET space_id = ?1 WHERE id = ?2",
             params![space_id, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Update a clip's JSON metadata (e.g. manual syntax language override).
+    pub fn update_clip_meta(&mut self, id: i64, meta: Option<&str>) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE clips SET meta = ?1 WHERE id = ?2",
+            params![meta, id],
         )?;
         Ok(changed > 0)
     }
@@ -655,13 +671,14 @@ fn prepare_clip(raw: &RawClip, config: &Config) -> PreparedClip {
                 formats.push(html.clone());
             }
         }
-        let hash = canonical_hash(ClipKind::Text, text.as_bytes());
+        let det = pf_core::detect::classify_text(&text);
+        let hash = canonical_hash(det.kind, text.as_bytes());
         return PreparedClip::Ready(PreparedData {
-            kind: ClipKind::Text,
+            kind: det.kind,
             content_hash: hash,
             preview: make_text_preview(&text),
             search_text: make_search_text(&text),
-            meta: None,
+            meta: det.meta_json,
             formats,
         });
     }
