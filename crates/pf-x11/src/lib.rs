@@ -1,5 +1,8 @@
 //! X11 clipboard engine (XFixes, ICCCM/INCR, SAVE_TARGETS, XGrabKey, XTEST).
 
+pub mod engine;
+pub use engine::X11Engine;
+
 use anyhow::{Context, Result, bail};
 use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection};

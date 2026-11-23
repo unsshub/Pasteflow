@@ -17,4 +17,10 @@ anyhow.workspace = true
 gdk4-x11.workspace = true
 gtk4.workspace = true
 ksni.workspace = true
+libc.workspace = true
+pf-core = { path = "../pf-core" }
+pf-store = { path = "../pf-store" }
+pf-x11 = { path = "../pf-x11" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 x11rb.workspace = true

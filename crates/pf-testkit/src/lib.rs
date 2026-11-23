@@ -26,6 +26,15 @@ struct PendingIncr {
     offset: usize,
 }
 
+/// Optional metadata attached to a `TestSelectionOwner` window for integration testing.
+#[derive(Debug, Clone, Default)]
+pub struct TestOwnerOptions {
+    /// Sets `WM_CLASS` (e.g. `("bitwarden-app", "Bitwarden")`).
+    pub wm_class: Option<(String, String)>,
+    /// Sets `_NET_WM_PID`.
+    pub pid: Option<u32>,
+}
+
 /// Spawns a background X11 client that owns `selection_name` and serves the given MIME payloads
 /// (automatically using ICCCM `INCR` when payload length exceeds 256 KiB).
 pub struct TestSelectionOwner {
@@ -39,6 +48,15 @@ impl TestSelectionOwner {
         display: Option<&str>,
         selection_name: &str,
         payloads: HashMap<String, Vec<u8>>,
+    ) -> Result<Self> {
+        Self::spawn_with_options(display, selection_name, payloads, TestOwnerOptions::default())
+    }
+
+    pub fn spawn_with_options(
+        display: Option<&str>,
+        selection_name: &str,
+        payloads: HashMap<String, Vec<u8>>,
+        options: TestOwnerOptions,
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_bg = Arc::clone(&stop);
@@ -70,6 +88,32 @@ impl TestSelectionOwner {
                 0,
                 &xproto::CreateWindowAux::new().event_mask(xproto::EventMask::PROPERTY_CHANGE),
             )?;
+
+            if let Some((instance, class)) = options.wm_class {
+                let mut val = Vec::new();
+                val.extend_from_slice(instance.as_bytes());
+                val.push(0);
+                val.extend_from_slice(class.as_bytes());
+                val.push(0);
+                conn.change_property8(
+                    PropMode::REPLACE,
+                    win,
+                    AtomEnum::WM_CLASS,
+                    AtomEnum::STRING,
+                    &val,
+                )?;
+            }
+
+            if let Some(pid) = options.pid {
+                let pid_atom = conn.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
+                conn.change_property32(
+                    PropMode::REPLACE,
+                    win,
+                    pid_atom,
+                    AtomEnum::CARDINAL,
+                    &[pid],
+                )?;
+            }
 
             let sel_atom = conn.intern_atom(false, sel_name.as_bytes())?.reply()?.atom;
             let targets_atom = conn.intern_atom(false, b"TARGETS")?.reply()?.atom;

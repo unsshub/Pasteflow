@@ -5,3 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+directories.workspace = true
+serde.workspace = true
+toml.workspace = true

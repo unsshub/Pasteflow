@@ -6,11 +6,17 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+libc.workspace = true
+pf-core = { path = "../pf-core" }
+tracing.workspace = true
 x11rb.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true
+image.workspace = true
+pf-store = { path = "../pf-store" }
 pf-testkit = { path = "../pf-testkit" }
+tempfile = "3"
 
 [[bin]]
 name = "pf-x11-probe"
