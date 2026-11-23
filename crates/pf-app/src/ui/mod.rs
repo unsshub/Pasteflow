@@ -1,4 +1,6 @@
 pub mod main_window;
+pub mod overlay;
+pub mod shortcut_dialog;
 
 use gtk4::CssProvider;
 use gtk4::gdk::Display;

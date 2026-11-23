@@ -1,5 +1,6 @@
+use crate::hotkeys::{self, HotkeyManager, HotkeyStatus};
 use anyhow::{Context, Result, bail};
-use pf_core::backend::{ClipboardBackend, ClipboardEvent};
+use pf_core::backend::{ClipboardBackend, ClipboardEvent, HotkeyAction};
 use pf_core::config::Config;
 use pf_core::model::{
     RawClip, RawFormat, SelectionKind, is_url_or_filename_only, now_unix_ms,
@@ -102,6 +103,7 @@ struct PendingIncr {
 /// owner identification, password-manager hint, SAVE_TARGETS handoff, empty-clipboard guard).
 pub struct X11Engine {
     conn: RustConnection,
+    screen_num: usize,
     root: xproto::Window,
     window: xproto::Window,
     atoms: Atoms,
@@ -114,6 +116,7 @@ pub struct X11Engine {
     pending_incrs: HashMap<(xproto::Window, xproto::Atom), PendingIncr>,
     empty_guard_deadline: Option<Instant>,
     atom_name_cache: HashMap<xproto::Atom, String>,
+    hotkeys: HotkeyManager,
 }
 
 impl X11Engine {
@@ -168,6 +171,7 @@ impl X11Engine {
 
         Ok(Self {
             conn,
+            screen_num,
             root,
             window,
             atoms,
@@ -180,7 +184,65 @@ impl X11Engine {
             pending_incrs: HashMap::new(),
             empty_guard_deadline: None,
             atom_name_cache: HashMap::new(),
+            hotkeys: HotkeyManager::default(),
         })
+    }
+
+    /// Register global X11 key grabs for the configured shortcuts.
+    pub fn register_hotkeys(&mut self, bindings: &[(HotkeyAction, String)]) -> Vec<HotkeyStatus> {
+        self.hotkeys.register(&self.conn, self.root, bindings)
+    }
+
+    /// Release all global X11 key grabs.
+    pub fn ungrab_hotkeys(&mut self) {
+        self.hotkeys.ungrab_all(&self.conn, self.root);
+    }
+
+    /// Return the currently active X11 window (`_NET_ACTIVE_WINDOW`), if any.
+    pub fn active_window(&self) -> Option<u32> {
+        self.get_window_prop_u32(self.root, self.atoms.net_active_window)
+            .filter(|&w| w != x11rb::NONE)
+    }
+
+    /// Return the current pointer `(x, y)` on the root screen.
+    pub fn pointer_position(&self) -> Option<(i32, i32)> {
+        hotkeys::query_pointer(&self.conn, self.root)
+    }
+
+    /// Position an overlay window via its XID, clamped to screen bounds.
+    pub fn position_overlay_window(
+        &self,
+        xid: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        user_time: Option<u32>,
+    ) -> Result<(i32, i32)> {
+        hotkeys::position_overlay_xid(
+            &self.conn,
+            self.screen_num,
+            xid,
+            x,
+            y,
+            width,
+            height,
+            user_time,
+        )
+    }
+
+    /// Request the window manager to restore focus to `target_window`.
+    pub fn focus_window(&self, target_window: u32) -> Result<()> {
+        hotkeys::activate_window(&self.conn, self.root, target_window)
+    }
+
+    /// Inject a synthetic paste chord (`Ctrl+V` or `Ctrl+Shift+V` for terminals)
+    /// into the focused window (optionally checking `target_window`'s `WM_CLASS`).
+    pub fn send_paste_chord(&self, target_window: Option<u32>) -> Result<()> {
+        let win = target_window.or_else(|| self.active_window());
+        let wm_class = win.and_then(|w| self.identify_owner_full(w).1);
+        let use_shift = self.config.uses_shift_paste(wm_class.as_deref());
+        hotkeys::inject_paste_chord(&self.conn, use_shift)
     }
 
     pub fn window(&self) -> xproto::Window {
@@ -914,6 +976,16 @@ impl ClipboardBackend for X11Engine {
                         Ok(Some(raw)) => emitted.push(ClipboardEvent::Captured(raw)),
                         Ok(None) => {}
                         Err(e) => warn!(error = %e, "failed to capture selection"),
+                    }
+                }
+                Event::KeyPress(kp) => {
+                    if let Some(action) = self.hotkeys.match_key_press(&kp) {
+                        let prev = self.active_window();
+                        emitted.push(ClipboardEvent::HotkeyPressed {
+                            action,
+                            timestamp: kp.time,
+                            previous_window: prev,
+                        });
                     }
                 }
                 other => {

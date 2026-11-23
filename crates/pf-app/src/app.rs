@@ -1,16 +1,19 @@
 use crate::autostart;
+use crate::cinnamon_keys;
 use crate::tray::{self, PasteFlowTray, TrayCommand};
 use crate::ui;
 use crate::ui::main_window::{MainWindow, UiAction};
+use crate::ui::overlay::{OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayAction, OverlayWindow};
+use crate::ui::shortcut_dialog::{ShortcutSettingsUpdate, show_shortcut_dialog};
 use anyhow::Result;
 use gtk4::gio::{self, ApplicationFlags};
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::Application;
-use pf_core::backend::{ClipboardBackend, ClipboardEvent};
+use pf_core::backend::{ClipboardBackend, ClipboardEvent, HotkeyAction};
 use pf_core::config::{AppPaths, Config};
 use pf_store::{InsertOutcome, Store};
-use pf_x11::X11Engine;
+use pf_x11::{HotkeyStatus, X11Engine};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
@@ -19,13 +22,16 @@ use tracing::{info, warn};
 pub const APP_ID: &str = "app.pasteflow.PasteFlow";
 
 struct AppState {
+    app: Application,
     paths: AppPaths,
     config: RefCell<Config>,
     store: Rc<RefCell<Store>>,
     engine: RefCell<Option<X11Engine>>,
     x11_source_id: Cell<Option<u32>>,
+    hotkey_statuses: RefCell<Vec<HotkeyStatus>>,
     tray: RefCell<Option<ksni::blocking::Handle<PasteFlowTray>>>,
     main_window: RefCell<Option<MainWindow>>,
+    overlay_window: RefCell<Option<OverlayWindow>>,
     hold_guard: RefCell<Option<gio::ApplicationHoldGuard>>,
     guard_timer_armed: Cell<bool>,
 }
@@ -107,10 +113,8 @@ pub fn run_gui(raw_args: &[String]) -> Result<()> {
 
     let state: Rc<RefCell<Option<Rc<AppState>>>> = Rc::new(RefCell::new(None));
 
-    // Register D-Bus actions for remote CLI/hotkey control
     register_actions(&app, Rc::clone(&state));
 
-    // Startup runs ONLY in the primary instance
     {
         let state_startup = Rc::clone(&state);
         app.connect_startup(move |app| {
@@ -127,7 +131,6 @@ pub fn run_gui(raw_args: &[String]) -> Result<()> {
         });
     }
 
-    // Command-line handler runs in the primary instance for both initial launch and remote invocations
     {
         let state_cmd = Rc::clone(&state);
         app.connect_command_line(move |app, cmdline| {
@@ -162,9 +165,14 @@ pub fn run_gui(raw_args: &[String]) -> Result<()> {
 
             if let Some(st) = state_cmd.borrow().as_ref() {
                 if toggle {
-                    toggle_main_window(app, st);
+                    let prev = st
+                        .engine
+                        .borrow()
+                        .as_ref()
+                        .and_then(|e| e.active_window());
+                    toggle_overlay(st, None, prev);
                 } else if !background {
-                    show_main_window(app, st);
+                    show_main_window(st);
                 }
             }
 
@@ -181,7 +189,6 @@ pub fn run_gui(raw_args: &[String]) -> Result<()> {
         });
     }
 
-    // Graceful shutdown: tear down tray, hand off clipboard via SAVE_TARGETS, truncate WAL
     {
         let state_shutdown = Rc::clone(&state);
         app.connect_shutdown(move |_| {
@@ -194,6 +201,7 @@ pub fn run_gui(raw_args: &[String]) -> Result<()> {
                     handle.shutdown();
                 }
                 if let Some(ref mut eng) = *st.engine.borrow_mut() {
+                    eng.ungrab_hotkeys();
                     if let Err(e) = eng.handoff_on_exit() {
                         warn!(error = %e, "SAVE_TARGETS handoff failed");
                     }
@@ -216,10 +224,10 @@ fn register_actions(app: &Application, state: Rc<RefCell<Option<Rc<AppState>>>>)
     let toggle_action = gio::SimpleAction::new("toggle", None);
     {
         let st_c = Rc::clone(&state);
-        let app_weak = app.downgrade();
         toggle_action.connect_activate(move |_, _| {
-            if let (Some(a), Some(st)) = (app_weak.upgrade(), st_c.borrow().as_ref()) {
-                toggle_main_window(&a, st);
+            if let Some(st) = st_c.borrow().as_ref() {
+                let prev = st.engine.borrow().as_ref().and_then(|e| e.active_window());
+                toggle_overlay(st, None, prev);
             }
         });
     }
@@ -228,10 +236,9 @@ fn register_actions(app: &Application, state: Rc<RefCell<Option<Rc<AppState>>>>)
     let show_action = gio::SimpleAction::new("show", None);
     {
         let st_c = Rc::clone(&state);
-        let app_weak = app.downgrade();
         show_action.connect_activate(move |_, _| {
-            if let (Some(a), Some(st)) = (app_weak.upgrade(), st_c.borrow().as_ref()) {
-                show_main_window(&a, st);
+            if let Some(st) = st_c.borrow().as_ref() {
+                show_main_window(st);
             }
         });
     }
@@ -255,7 +262,6 @@ fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
     let store = Store::open(&paths)?;
     let _ = store.sweep_orphan_blobs()?;
 
-    // Keep application alive with zero open windows (tray resident)
     let hold_guard = app.hold();
 
     let (tray_tx, tray_rx) = async_channel::unbounded::<TrayCommand>();
@@ -279,18 +285,24 @@ fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
     let engine_fd = engine.as_ref().map(|e| e.as_raw_fd());
 
     let state = Rc::new(AppState {
+        app: app.clone(),
         paths,
         config: RefCell::new(config),
         store: Rc::new(RefCell::new(store)),
         engine: RefCell::new(engine),
         x11_source_id: Cell::new(None),
+        hotkey_statuses: RefCell::new(Vec::new()),
         tray: RefCell::new(tray_handle),
         main_window: RefCell::new(None),
+        overlay_window: RefCell::new(None),
         hold_guard: RefCell::new(Some(hold_guard)),
         guard_timer_armed: Cell::new(false),
     });
 
-    // Attach X11 socket fd to GLib MainLoop (event-driven, 0 idle wakeups!)
+    // Apply global shortcut provider (X11 grab or Cinnamon custom keybindings)
+    let statuses = apply_hotkey_provider(&state);
+    *state.hotkey_statuses.borrow_mut() = statuses;
+
     if let Some(fd) = engine_fd {
         let st_fd = Rc::clone(&state);
         let tag = attach_unix_fd_local(fd, move || {
@@ -300,22 +312,58 @@ fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
         state.x11_source_id.set(Some(tag));
     }
 
-    // Listen for TrayCommands on the GLib MainLoop
     {
         let st_tray = Rc::clone(&state);
-        let app_weak = app.downgrade();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(cmd) = tray_rx.recv().await {
-                let Some(a) = app_weak.upgrade() else {
-                    break;
-                };
-                handle_tray_command(&a, &st_tray, cmd);
+                handle_tray_command(&st_tray, cmd);
             }
         });
     }
 
     info!("PasteFlow primary instance ready");
     Ok(state)
+}
+
+fn apply_hotkey_provider(state: &Rc<AppState>) -> Vec<HotkeyStatus> {
+    let cfg = state.config.borrow().clone();
+    if cfg.use_cinnamon_keybindings {
+        if let Some(ref mut eng) = *state.engine.borrow_mut() {
+            eng.ungrab_hotkeys();
+        }
+        if let Err(e) = cinnamon_keys::sync_cinnamon_keybindings(
+            true,
+            &cfg.overlay_shortcut,
+            &cfg.paste_next_shortcut,
+        ) {
+            warn!(error = %e, "failed to sync Cinnamon custom keybindings");
+        }
+        return vec![
+            HotkeyStatus {
+                action: HotkeyAction::ToggleOverlay,
+                accel: cfg.overlay_shortcut,
+                grabbed: true,
+                error: None,
+            },
+            HotkeyStatus {
+                action: HotkeyAction::PasteNext,
+                accel: cfg.paste_next_shortcut,
+                grabbed: true,
+                error: None,
+            },
+        ];
+    }
+
+    // X11 in-process grab provider
+    let bindings = [
+        (HotkeyAction::ToggleOverlay, cfg.overlay_shortcut.clone()),
+        (HotkeyAction::PasteNext, cfg.paste_next_shortcut.clone()),
+    ];
+    if let Some(ref mut eng) = *state.engine.borrow_mut() {
+        eng.register_hotkeys(&bindings)
+    } else {
+        Vec::new()
+    }
 }
 
 fn pump_x11_events(state: &Rc<AppState>) {
@@ -363,17 +411,31 @@ fn pump_x11_events(state: &Rc<AppState>) {
             ClipboardEvent::SelectionServed { target } => {
                 info!(target = %target, "served clipboard target");
             }
+            ClipboardEvent::HotkeyPressed {
+                action,
+                timestamp,
+                previous_window,
+            } => match action {
+                HotkeyAction::ToggleOverlay => {
+                    toggle_overlay(state, Some(timestamp), previous_window);
+                }
+                HotkeyAction::PasteNext => {
+                    info!("PasteNext hotkey pressed (Paste Queue lands in M5)");
+                    send_notification(
+                        &state.app,
+                        "paste-next",
+                        "PasteFlow",
+                        "Paste Queue will be enabled in M5.",
+                    );
+                }
+            },
         }
     }
 
-    if store_changed
-        && let Some(ref win) = *state.main_window.borrow()
-        && win.window().is_visible()
-    {
-        win.refresh();
+    if store_changed {
+        refresh_open_views(state);
     }
 
-    // Arm a single one-shot timer only when the empty-clipboard guard needs to fire
     let next_ms = state
         .engine
         .borrow()
@@ -389,21 +451,31 @@ fn pump_x11_events(state: &Rc<AppState>) {
     }
 }
 
-fn ensure_main_window(app: &Application, state: &Rc<AppState>) {
+fn refresh_open_views(state: &Rc<AppState>) {
+    if let Some(ref win) = *state.main_window.borrow()
+        && win.window().is_visible()
+    {
+        win.refresh();
+    }
+    if let Some(ref ov) = *state.overlay_window.borrow()
+        && ov.is_visible()
+    {
+        ov.refresh();
+    }
+}
+
+fn ensure_main_window(state: &Rc<AppState>) {
     if state.main_window.borrow().is_some() {
         return;
     }
     let st_act = Rc::clone(state);
-    let app_weak = app.downgrade();
     let on_action: Rc<dyn Fn(UiAction)> = Rc::new(move |action| {
-        if let Some(a) = app_weak.upgrade() {
-            handle_ui_action(&a, &st_act, action);
-        }
+        handle_ui_action(&st_act, action);
     });
 
     let paused = state.config.borrow().paused;
     let win = MainWindow::new(
-        app,
+        &state.app,
         Rc::clone(&state.store),
         state.paths.thumbs_dir(),
         paused,
@@ -412,25 +484,151 @@ fn ensure_main_window(app: &Application, state: &Rc<AppState>) {
     *state.main_window.borrow_mut() = Some(win);
 }
 
-fn show_main_window(app: &Application, state: &Rc<AppState>) {
-    ensure_main_window(app, state);
+fn ensure_overlay_window(state: &Rc<AppState>) {
+    if state.overlay_window.borrow().is_some() {
+        return;
+    }
+    let st_act = Rc::clone(state);
+    let on_action: Rc<dyn Fn(OverlayAction)> = Rc::new(move |action| {
+        handle_overlay_action(&st_act, action);
+    });
+    let ov = OverlayWindow::new(
+        &state.app,
+        Rc::clone(&state.store),
+        state.paths.thumbs_dir(),
+        on_action,
+    );
+    *state.overlay_window.borrow_mut() = Some(ov);
+}
+
+fn show_main_window(state: &Rc<AppState>) {
+    ensure_main_window(state);
     if let Some(ref win) = *state.main_window.borrow() {
         win.present();
     }
 }
 
-fn toggle_main_window(app: &Application, state: &Rc<AppState>) {
-    ensure_main_window(app, state);
+fn toggle_main_window(state: &Rc<AppState>) {
+    ensure_main_window(state);
     if let Some(ref win) = *state.main_window.borrow() {
         win.toggle();
     }
 }
 
-fn handle_tray_command(app: &Application, state: &Rc<AppState>, cmd: TrayCommand) {
+fn toggle_overlay(
+    state: &Rc<AppState>,
+    user_time: Option<u32>,
+    previous_window: Option<u32>,
+) {
+    ensure_overlay_window(state);
+    let overlay_at_pointer = state.config.borrow().overlay_at_pointer;
+    if let Some(ref ov) = *state.overlay_window.borrow() {
+        if ov.is_visible() {
+            ov.hide();
+            if let Some(prev) = previous_window
+                && let Some(ref eng) = *state.engine.borrow()
+            {
+                let _ = eng.focus_window(prev);
+            }
+        } else {
+            ov.show_and_focus(previous_window, |xid| {
+                if overlay_at_pointer
+                    && let Some(ref eng) = *state.engine.borrow()
+                    && let Some((px, py)) = eng.pointer_position()
+                {
+                    let _ = eng.position_overlay_window(
+                        xid,
+                        px - OVERLAY_WIDTH / 2,
+                        py - 24,
+                        OVERLAY_WIDTH,
+                        OVERLAY_HEIGHT,
+                        user_time,
+                    );
+                }
+            });
+        }
+    }
+}
+
+fn open_shortcuts_dialog(state: &Rc<AppState>) {
+    let cfg = state.config.borrow().clone();
+    let statuses = state.hotkey_statuses.borrow().clone();
+    let st_c = Rc::clone(state);
+    let on_apply: Rc<dyn Fn(ShortcutSettingsUpdate) -> Vec<HotkeyStatus>> = Rc::new(move |upd| {
+        let was_cinnamon = st_c.config.borrow().use_cinnamon_keybindings;
+        {
+            let mut c = st_c.config.borrow_mut();
+            c.overlay_shortcut = upd.overlay_shortcut;
+            c.paste_next_shortcut = upd.paste_next_shortcut;
+            c.use_cinnamon_keybindings = upd.use_cinnamon_keybindings;
+            c.overlay_at_pointer = upd.overlay_at_pointer;
+            let _ = c.save(&st_c.paths);
+        }
+        if was_cinnamon && !upd.use_cinnamon_keybindings {
+            let _ = cinnamon_keys::sync_cinnamon_keybindings(false, "", "");
+        }
+        let new_statuses = apply_hotkey_provider(&st_c);
+        *st_c.hotkey_statuses.borrow_mut() = new_statuses.clone();
+        new_statuses
+    });
+    show_shortcut_dialog(&state.app, &cfg, &statuses, on_apply);
+}
+
+fn handle_overlay_action(state: &Rc<AppState>, action: OverlayAction) {
+    match action {
+        OverlayAction::CopyAndClose {
+            clip_id,
+            previous_window,
+        } => {
+            copy_clip_to_clipboard(state, clip_id);
+            if let Some(prev) = previous_window
+                && let Some(ref eng) = *state.engine.borrow()
+            {
+                let _ = eng.focus_window(prev);
+            }
+        }
+        OverlayAction::PasteAndClose {
+            clip_id,
+            previous_window,
+        } => {
+            copy_clip_to_clipboard(state, clip_id);
+            if let Some(prev) = previous_window
+                && let Some(ref eng) = *state.engine.borrow()
+            {
+                let _ = eng.focus_window(prev);
+            }
+            // Brief delay so Muffin finishes restoring focus before XTEST injects Ctrl+V
+            let st_c = Rc::clone(state);
+            glib::timeout_add_local_once(Duration::from_millis(60), move || {
+                if let Some(ref eng) = *st_c.engine.borrow() {
+                    if let Err(e) = eng.send_paste_chord(previous_window) {
+                        warn!(error = %e, "synthetic paste failed");
+                    }
+                }
+            });
+        }
+        OverlayAction::TogglePin(id) => handle_ui_action(state, UiAction::TogglePin(id)),
+        OverlayAction::DeleteClip(id) => handle_ui_action(state, UiAction::DeleteClip(id)),
+        OverlayAction::Closed { previous_window } => {
+            if let Some(prev) = previous_window
+                && let Some(ref eng) = *state.engine.borrow()
+            {
+                let _ = eng.focus_window(prev);
+            }
+        }
+    }
+}
+
+fn handle_tray_command(state: &Rc<AppState>, cmd: TrayCommand) {
     match cmd {
-        TrayCommand::ShowMain => show_main_window(app, state),
-        TrayCommand::ToggleMain => toggle_main_window(app, state),
-        TrayCommand::TogglePause => toggle_pause(app, state),
+        TrayCommand::ShowMain => show_main_window(state),
+        TrayCommand::ToggleMain => toggle_main_window(state),
+        TrayCommand::ToggleOverlay => {
+            let prev = state.engine.borrow().as_ref().and_then(|e| e.active_window());
+            toggle_overlay(state, None, prev);
+        }
+        TrayCommand::OpenShortcuts => open_shortcuts_dialog(state),
+        TrayCommand::TogglePause => toggle_pause(state),
         TrayCommand::ToggleAutostart => {
             let next = !autostart::is_autostart_enabled();
             match autostart::set_autostart_enabled(next) {
@@ -439,7 +637,7 @@ fn handle_tray_command(app: &Application, state: &Rc<AppState>, cmd: TrayCommand
                         handle.update(|t| t.autostart = next);
                     }
                     send_notification(
-                        app,
+                        &state.app,
                         "autostart",
                         "PasteFlow",
                         if next {
@@ -452,38 +650,38 @@ fn handle_tray_command(app: &Application, state: &Rc<AppState>, cmd: TrayCommand
                 Err(e) => warn!(error = %e, "failed to toggle autostart"),
             }
         }
-        TrayCommand::ClearUnpinned => handle_ui_action(app, state, UiAction::ClearUnpinned),
-        TrayCommand::Quit => app.quit(),
+        TrayCommand::ClearUnpinned => handle_ui_action(state, UiAction::ClearUnpinned),
+        TrayCommand::Quit => state.app.quit(),
     }
 }
 
-fn handle_ui_action(app: &Application, state: &Rc<AppState>, action: UiAction) {
-    match action {
-        UiAction::CopyClip(id) => {
-            let formats = match state.store.borrow().get_clip_formats(id) {
-                Ok(f) if !f.is_empty() => f,
-                Ok(_) => return,
-                Err(e) => {
-                    warn!(error = %e, id, "failed to load clip formats");
-                    return;
-                }
-            };
-            if let Some(ref mut eng) = *state.engine.borrow_mut() {
-                if let Err(e) = eng.own_clipboard(formats) {
-                    warn!(error = %e, id, "failed to own clipboard");
-                    return;
-                }
-                info!(id, "copied clip back to CLIPBOARD");
-            }
+fn copy_clip_to_clipboard(state: &Rc<AppState>, id: i64) {
+    let formats = match state.store.borrow().get_clip_formats(id) {
+        Ok(f) if !f.is_empty() => f,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(error = %e, id, "failed to load clip formats");
+            return;
         }
+    };
+    if let Some(ref mut eng) = *state.engine.borrow_mut() {
+        if let Err(e) = eng.own_clipboard(formats) {
+            warn!(error = %e, id, "failed to own clipboard");
+            return;
+        }
+        info!(id, "copied clip back to CLIPBOARD");
+    }
+}
+
+fn handle_ui_action(state: &Rc<AppState>, action: UiAction) {
+    match action {
+        UiAction::CopyClip(id) => copy_clip_to_clipboard(state, id),
         UiAction::DeleteClip(id) => {
             if let Err(e) = state.store.borrow_mut().delete_clip(id) {
                 warn!(error = %e, id, "failed to delete clip");
                 return;
             }
-            if let Some(ref win) = *state.main_window.borrow() {
-                win.refresh();
-            }
+            refresh_open_views(state);
         }
         UiAction::TogglePin(id) => {
             let current = state
@@ -495,32 +693,27 @@ fn handle_ui_action(app: &Application, state: &Rc<AppState>, action: UiAction) {
                 .map(|c| c.pinned);
             if let Some(pinned) = current {
                 let _ = state.store.borrow_mut().set_pinned(id, !pinned);
-                if let Some(ref win) = *state.main_window.borrow() {
-                    win.refresh();
-                }
+                refresh_open_views(state);
             }
         }
-        UiAction::TogglePause => toggle_pause(app, state),
-        UiAction::ClearUnpinned => {
-            match state.store.borrow_mut().clear_history(false) {
-                Ok(n) => {
-                    if let Some(ref win) = *state.main_window.borrow() {
-                        win.refresh();
-                    }
-                    send_notification(
-                        app,
-                        "clear",
-                        "PasteFlow",
-                        &format!("Cleared {n} unpinned clip{}.", if n == 1 { "" } else { "s" }),
-                    );
-                }
-                Err(e) => warn!(error = %e, "failed to clear history"),
+        UiAction::TogglePause => toggle_pause(state),
+        UiAction::ClearUnpinned => match state.store.borrow_mut().clear_history(false) {
+            Ok(n) => {
+                refresh_open_views(state);
+                send_notification(
+                    &state.app,
+                    "clear",
+                    "PasteFlow",
+                    &format!("Cleared {n} unpinned clip{}.", if n == 1 { "" } else { "s" }),
+                );
             }
-        }
+            Err(e) => warn!(error = %e, "failed to clear history"),
+        },
+        UiAction::OpenShortcuts => open_shortcuts_dialog(state),
     }
 }
 
-fn toggle_pause(app: &Application, state: &Rc<AppState>) {
+fn toggle_pause(state: &Rc<AppState>) {
     let next = {
         let mut cfg = state.config.borrow_mut();
         cfg.paused = !cfg.paused;
@@ -537,7 +730,7 @@ fn toggle_pause(app: &Application, state: &Rc<AppState>) {
         win.set_paused_ui(next);
     }
     send_notification(
-        app,
+        &state.app,
         "pause",
         "PasteFlow",
         if next {

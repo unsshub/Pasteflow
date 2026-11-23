@@ -1,6 +1,13 @@
 use crate::model::{RawClip, RawFormat, SelectionKind};
 use anyhow::Result;
 
+/// Global hotkey actions registered with the platform backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HotkeyAction {
+    ToggleOverlay,
+    PasteNext,
+}
+
 /// Events emitted by a clipboard backend (X11 or future Wayland).
 #[derive(Debug, Clone)]
 pub enum ClipboardEvent {
@@ -10,6 +17,12 @@ pub enum ClipboardEvent {
     OwnerVanished { selection: SelectionKind },
     /// PasteFlow served a data target to an external requestor.
     SelectionServed { target: String },
+    /// A registered global hotkey was pressed.
+    HotkeyPressed {
+        action: HotkeyAction,
+        timestamp: u32,
+        previous_window: Option<u32>,
+    },
 }
 
 /// Abstraction over platform clipboard engines (X11 in v1, Wayland in M10).

@@ -21,6 +21,7 @@ pub enum UiAction {
     TogglePin(i64),
     TogglePause,
     ClearUnpinned,
+    OpenShortcuts,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -208,6 +209,12 @@ impl MainWindow {
             .build();
         toolbar.append(&clear_btn);
 
+        let shortcuts_btn = Button::builder()
+            .icon_name("preferences-desktop-keyboard-shortcuts-symbolic")
+            .tooltip_text("Global shortcuts")
+            .build();
+        toolbar.append(&shortcuts_btn);
+
         content_vbox.append(&toolbar);
 
         let paused_banner = Label::new(Some("Clipboard capture is paused"));
@@ -295,6 +302,12 @@ impl MainWindow {
             let act = Rc::clone(&on_action);
             clear_btn.connect_clicked(move |_| {
                 act(UiAction::ClearUnpinned);
+            });
+        }
+        {
+            let act = Rc::clone(&on_action);
+            shortcuts_btn.connect_clicked(move |_| {
+                act(UiAction::OpenShortcuts);
             });
         }
 

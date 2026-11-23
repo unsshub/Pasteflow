@@ -1,5 +1,6 @@
 mod app;
 mod autostart;
+mod cinnamon_keys;
 mod tray;
 mod ui;
 
@@ -143,6 +144,7 @@ fn run_headless() -> Result<()> {
                 ClipboardEvent::SelectionServed { target } => {
                     info!(target = %target, "served clipboard target");
                 }
+                ClipboardEvent::HotkeyPressed { .. } => {}
             }
         }
     }

@@ -1,7 +1,9 @@
 //! X11 clipboard engine (XFixes, ICCCM/INCR, SAVE_TARGETS, XGrabKey, XTEST).
 
 pub mod engine;
+pub mod hotkeys;
 pub use engine::X11Engine;
+pub use hotkeys::HotkeyStatus;
 
 use anyhow::{Context, Result, bail};
 use std::time::{Duration, Instant};

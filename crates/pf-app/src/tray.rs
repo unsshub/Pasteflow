@@ -7,6 +7,8 @@ use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
 pub enum TrayCommand {
     ShowMain,
     ToggleMain,
+    ToggleOverlay,
+    OpenShortcuts,
     TogglePause,
     ToggleAutostart,
     ClearUnpinned,
@@ -47,10 +49,28 @@ impl ksni::Tray for PasteFlowTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         vec![
             StandardItem {
+                label: "Quick Overlay".to_string(),
+                icon_name: "edit-find-symbolic".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.tx.send_blocking(TrayCommand::ToggleOverlay);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
                 label: "Open PasteFlow".to_string(),
                 icon_name: "window-new-symbolic".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.send_blocking(TrayCommand::ShowMain);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Shortcuts…".to_string(),
+                icon_name: "preferences-desktop-keyboard-shortcuts-symbolic".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.tx.send_blocking(TrayCommand::OpenShortcuts);
                 }),
                 ..Default::default()
             }

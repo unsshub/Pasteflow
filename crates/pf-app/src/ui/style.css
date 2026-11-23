@@ -58,3 +58,7 @@
     opacity: 0.65;
     font-size: 1.05em;
 }
+
+.pf-overlay {
+    border: 1px solid alpha(currentColor, 0.22);
+}

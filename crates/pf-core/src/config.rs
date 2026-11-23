@@ -91,6 +91,95 @@ pub fn create_private_dir(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Parsed keyboard shortcut (GTK/Cinnamon accelerator format, e.g. `<Super>v`, `<Primary><Shift>b`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShortcutSpec {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub super_key: bool,
+    /// Lowercase ASCII/X11 keysym name (e.g. `"v"`, `"b"`, `"space"`).
+    pub key: String,
+}
+
+impl ShortcutSpec {
+    /// Parse a GTK/Cinnamon accelerator string like `<Super>v` or `<Primary><Shift>v`.
+    pub fn parse(input: &str) -> Option<Self> {
+        let mut s = input.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let mut ctrl = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut super_key = false;
+
+        while s.starts_with('<') {
+            let end = s.find('>')?;
+            let token = &s[1..end];
+            match token.to_ascii_lowercase().as_str() {
+                "control" | "ctrl" | "primary" => ctrl = true,
+                "alt" | "mod1" => alt = true,
+                "shift" => shift = true,
+                "super" | "mod4" | "meta" => super_key = true,
+                _ => return None,
+            }
+            s = &s[end + 1..];
+        }
+
+        let key = s.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return None;
+        }
+        Some(Self {
+            ctrl,
+            alt,
+            shift,
+            super_key,
+            key,
+        })
+    }
+
+    /// Format back into canonical Cinnamon/GTK accelerator syntax.
+    pub fn to_accel_string(&self) -> String {
+        let mut out = String::new();
+        if self.super_key {
+            out.push_str("<Super>");
+        }
+        if self.ctrl {
+            out.push_str("<Primary>");
+        }
+        if self.alt {
+            out.push_str("<Alt>");
+        }
+        if self.shift {
+            out.push_str("<Shift>");
+        }
+        out.push_str(&self.key);
+        out
+    }
+
+    /// Map `self.key` to an X11 keysym value (supports ASCII letters/digits and common keys).
+    pub fn x11_keysym(&self) -> Option<u32> {
+        if self.key.len() == 1 {
+            let ch = self.key.chars().next()?;
+            if ch.is_ascii_alphanumeric() {
+                return Some(ch.to_ascii_lowercase() as u32);
+            }
+        }
+        match self.key.as_str() {
+            "space" => Some(0x0020),
+            "return" | "enter" => Some(0xff0d),
+            "tab" => Some(0xff09),
+            "escape" | "esc" => Some(0xff1b),
+            "backspace" => Some(0xff08),
+            "insert" => Some(0xff63),
+            "delete" => Some(0xffff),
+            _ => None,
+        }
+    }
+}
+
 /// Persistent PasteFlow configuration (`~/.config/pasteflow/config.toml`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -106,6 +195,11 @@ pub struct Config {
     pub empty_clipboard_guard: bool,
     pub paused: bool,
     pub excluded_apps: Vec<String>,
+    pub overlay_shortcut: String,
+    pub paste_next_shortcut: String,
+    pub use_cinnamon_keybindings: bool,
+    pub overlay_at_pointer: bool,
+    pub terminal_paste_classes: Vec<String>,
 }
 
 impl Default for Config {
@@ -127,11 +221,44 @@ impl Default for Config {
                 "KeePassXC".to_string(),
                 "1Password".to_string(),
             ],
+            overlay_shortcut: "<Super>v".to_string(),
+            paste_next_shortcut: "<Super><Shift>v".to_string(),
+            use_cinnamon_keybindings: false,
+            overlay_at_pointer: true,
+            terminal_paste_classes: vec![
+                "gnome-terminal-server".to_string(),
+                "kitty".to_string(),
+                "Alacritty".to_string(),
+                "xfce4-terminal".to_string(),
+                "tilix".to_string(),
+                "xterm".to_string(),
+                "konsole".to_string(),
+            ],
         }
     }
 }
 
 impl Config {
+    pub fn apply_default_shortcuts(&mut self) {
+        self.overlay_shortcut = "<Super>v".to_string();
+        self.paste_next_shortcut = "<Super><Shift>v".to_string();
+    }
+
+    pub fn apply_pastily_shortcuts(&mut self) {
+        self.overlay_shortcut = "<Primary><Shift>b".to_string();
+        self.paste_next_shortcut = "<Primary><Shift>v".to_string();
+    }
+
+    /// Check if `wm_class` belongs to a terminal that pastes with `Ctrl+Shift+V`.
+    pub fn uses_shift_paste(&self, wm_class: Option<&str>) -> bool {
+        let Some(cls) = wm_class else {
+            return false;
+        };
+        let lower = cls.to_ascii_lowercase();
+        self.terminal_paste_classes
+            .iter()
+            .any(|t| !t.is_empty() && lower.contains(&t.to_ascii_lowercase()))
+    }
     pub fn load_or_default(paths: &AppPaths) -> Result<Self> {
         let file = paths.config_file();
         if !file.exists() {
@@ -207,5 +334,20 @@ mod tests {
         let parsed: Config = toml::from_str(&s).unwrap();
         assert_eq!(parsed.max_history, 2_000);
         assert_eq!(parsed.excluded_apps.len(), 4);
+        assert_eq!(parsed.overlay_shortcut, "<Super>v");
+    }
+
+    #[test]
+    fn shortcut_spec_parse_and_format() {
+        let s = ShortcutSpec::parse("<Super><Shift>v").unwrap();
+        assert!(s.super_key && s.shift && !s.ctrl && !s.alt);
+        assert_eq!(s.key, "v");
+        assert_eq!(s.x11_keysym(), Some(0x0076));
+        assert_eq!(s.to_accel_string(), "<Super><Shift>v");
+
+        let p = ShortcutSpec::parse("<Primary><Shift>B").unwrap();
+        assert!(p.ctrl && p.shift && !p.super_key);
+        assert_eq!(p.key, "b");
+        assert_eq!(p.to_accel_string(), "<Primary><Shift>b");
     }
 }
