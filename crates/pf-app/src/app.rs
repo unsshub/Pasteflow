@@ -417,6 +417,50 @@ fn pump_x11_events(state: &Rc<AppState>) {
         }
     };
 
+    if !events.is_empty() {
+        process_x11_events(state, events);
+    }
+
+    let next_ms = state
+        .engine
+        .borrow()
+        .as_ref()
+        .map(|e| e.next_timeout_ms())
+        .unwrap_or(-1);
+    if next_ms > 0 && !state.guard_timer_armed.replace(true) {
+        let st_timer = Rc::clone(state);
+        glib::timeout_add_local_once(Duration::from_millis(next_ms as u64 + 5), move || {
+            st_timer.guard_timer_armed.set(false);
+            pump_x11_events(&st_timer);
+        });
+    }
+
+    // Drain any X11 events that `x11rb` may have buffered into userspace while reading replies
+    // during hotkey/capture handlers (prevents events from sitting unread while the fd is quiet).
+    let st_drain = Rc::clone(state);
+    glib::idle_add_local_once(move || {
+        drain_buffered_x11_events(&st_drain);
+    });
+}
+
+fn drain_buffered_x11_events(state: &Rc<AppState>) {
+    // Only recurse if `poll_events` actually found buffered events.
+    let had_events = {
+        let mut eng_ref = state.engine.borrow_mut();
+        match eng_ref.as_mut() {
+            Some(eng) => match eng.poll_events() {
+                Ok(evs) if !evs.is_empty() => Some(evs),
+                _ => None,
+            },
+            None => None,
+        }
+    };
+    if let Some(events) = had_events {
+        process_x11_events(state, events);
+    }
+}
+
+fn process_x11_events(state: &Rc<AppState>, events: Vec<ClipboardEvent>) {
     let mut store_changed = false;
     let cfg = state.config.borrow().clone();
 
@@ -454,20 +498,6 @@ fn pump_x11_events(state: &Rc<AppState>) {
 
     if store_changed {
         refresh_open_views(state);
-    }
-
-    let next_ms = state
-        .engine
-        .borrow()
-        .as_ref()
-        .map(|e| e.next_timeout_ms())
-        .unwrap_or(-1);
-    if next_ms > 0 && !state.guard_timer_armed.replace(true) {
-        let st_timer = Rc::clone(state);
-        glib::timeout_add_local_once(Duration::from_millis(next_ms as u64 + 5), move || {
-            st_timer.guard_timer_armed.set(false);
-            pump_x11_events(&st_timer);
-        });
     }
 }
 
@@ -554,21 +584,30 @@ fn toggle_overlay(
                 let _ = eng.focus_window(prev);
             }
         } else {
-            ov.show_and_focus(previous_window, |xid| {
-                if overlay_at_pointer
-                    && let Some(ref eng) = *state.engine.borrow()
-                    && let Some((px, py)) = eng.pointer_position()
-                {
-                    let _ = eng.position_overlay_window(
-                        xid,
-                        px - OVERLAY_WIDTH / 2,
-                        py - 24,
-                        OVERLAY_WIDTH,
-                        OVERLAY_HEIGHT,
-                        user_time,
-                    );
-                }
-            });
+            ov.show_and_focus(
+                previous_window,
+                user_time,
+                |xid| {
+                    if overlay_at_pointer
+                        && let Some(ref eng) = *state.engine.borrow()
+                        && let Some((px, py)) = eng.pointer_position()
+                    {
+                        let _ = eng.position_overlay_window(
+                            xid,
+                            px - OVERLAY_WIDTH / 2,
+                            py - 24,
+                            OVERLAY_WIDTH,
+                            OVERLAY_HEIGHT,
+                            user_time,
+                        );
+                    }
+                },
+                |xid| {
+                    if let Some(ref eng) = *state.engine.borrow() {
+                        let _ = eng.focus_window(xid);
+                    }
+                },
+            );
         }
     }
 }

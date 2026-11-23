@@ -15,6 +15,7 @@ use pf_store::Store;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 pub const OVERLAY_WIDTH: i32 = 520;
 pub const OVERLAY_HEIGHT: i32 = 420;
@@ -56,6 +57,7 @@ pub struct OverlayWindow {
     selection: SingleSelection,
     filter_idx: Rc<Cell<usize>>,
     previous_window: Rc<Cell<Option<u32>>>,
+    last_shown_at: Rc<Cell<Instant>>,
     store: Rc<RefCell<Store>>,
 }
 
@@ -104,6 +106,7 @@ impl OverlayWindow {
 
         let previous_window = Rc::new(Cell::new(None));
         let filter_idx = Rc::new(Cell::new(0usize));
+        let last_shown_at = Rc::new(Cell::new(Instant::now() - Duration::from_secs(10)));
 
         // Clicking a row copies & closes
         {
@@ -146,12 +149,17 @@ impl OverlayWindow {
 
         window.set_child(Some(&vbox));
 
-        // Hide when window loses focus
+        // Hide when window loses focus (with a 300 ms grace period after show so Muffin's
+        // initial map/focus handoff never immediately hides the newly opened overlay).
         {
             let prev_c = Rc::clone(&previous_window);
+            let shown_c = Rc::clone(&last_shown_at);
             let act_c = Rc::clone(&on_action);
             window.connect_is_active_notify(move |w| {
-                if !w.is_active() && w.is_visible() {
+                if !w.is_active()
+                    && w.is_visible()
+                    && shown_c.get().elapsed() > Duration::from_millis(300)
+                {
                     w.set_visible(false);
                     act_c(OverlayAction::Closed {
                         previous_window: prev_c.get(),
@@ -326,6 +334,7 @@ impl OverlayWindow {
             selection,
             filter_idx,
             previous_window,
+            last_shown_at,
             store,
         }
     }
@@ -346,9 +355,16 @@ impl OverlayWindow {
     }
 
     /// Prepare the overlay (reset search & filter, reload latest 50 clips),
-    /// present it, and focus the search field immediately.
-    pub fn show_and_focus(&self, previous_window: Option<u32>, position_fn: impl FnOnce(u32)) {
+    /// present it with the hotkey timestamp, and focus the search field immediately.
+    pub fn show_and_focus(
+        &self,
+        previous_window: Option<u32>,
+        user_time: Option<u32>,
+        position_fn: impl Fn(u32),
+        activate_fn: impl FnOnce(u32),
+    ) {
         self.previous_window.set(previous_window);
+        self.last_shown_at.set(Instant::now());
         self.filter_idx.set(0);
         self.filter_badge.set_text("ALL");
         if !self.search_entry.text().is_empty() {
@@ -360,7 +376,20 @@ impl OverlayWindow {
         if let Some(xid) = self.xid() {
             position_fn(xid);
         }
-        self.window.present();
+
+        if let Some(ts) = user_time
+            && ts != 0
+        {
+            #[allow(deprecated)]
+            self.window.present_with_time(ts);
+        } else {
+            self.window.present();
+        }
+
+        if let Some(xid) = self.xid() {
+            position_fn(xid);
+            activate_fn(xid);
+        }
         self.search_entry.grab_focus();
     }
 
