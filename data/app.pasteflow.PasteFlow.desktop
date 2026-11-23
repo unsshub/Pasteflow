@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=PasteFlow
+GenericName=Clipboard Manager
+Comment=Fast, private, offline-first native Linux clipboard manager
+Exec=pasteflow
+Icon=app.pasteflow.PasteFlow
+Terminal=false
+Categories=Utility;GTK;
+Keywords=clipboard;history;paste;snippets;
+StartupNotify=true
+DBusActivatable=false

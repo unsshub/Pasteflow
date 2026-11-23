@@ -29,6 +29,16 @@ pub enum InsertOutcome {
     Skipped(&'static str),
 }
 
+/// Database and storage statistics for Diagnostics / Settings.
+#[derive(Debug, Clone)]
+pub struct DbStats {
+    pub clip_count: usize,
+    pub space_count: usize,
+    pub queue_count: usize,
+    pub db_bytes: u64,
+    pub wal_bytes: u64,
+}
+
 /// Primary SQLite + blob store handle.
 pub struct Store {
     conn: Connection,
@@ -782,6 +792,120 @@ impl Store {
         rotate_backups(bdir, max_keep)?;
         info!(path = %dest.display(), "created database backup snapshot");
         Ok(dest)
+    }
+
+    /// Reclaim unused SQLite pages and truncate the WAL file.
+    pub fn vacuum_now(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM;")?;
+        self.wal_checkpoint_truncate()?;
+        Ok(())
+    }
+
+    /// Compute database row counts and file sizes for Diagnostics.
+    pub fn stats(&self, db_path: &Path) -> Result<DbStats> {
+        let clip_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))?;
+        let space_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM spaces", [], |r| r.get(0))?;
+        let queue_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM queue_items", [], |r| r.get(0))?;
+        let db_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+        let wal_bytes = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        Ok(DbStats {
+            clip_count: usize::try_from(clip_count).unwrap_or(0),
+            space_count: usize::try_from(space_count).unwrap_or(0),
+            queue_count: usize::try_from(queue_count).unwrap_or(0),
+            db_bytes,
+            wal_bytes,
+        })
+    }
+
+    /// Export persistent text/code/url/color/contact/number/files clips to a local JSON file.
+    pub fn export_json(&self, dest: &Path) -> Result<usize> {
+        let clips = self.list_clips(&ClipFilter::recent(100_000))?;
+        let mut items = Vec::new();
+        for c in &clips {
+            if c.kind == ClipKind::Image {
+                continue;
+            }
+            let formats = self.get_clip_formats(c.id)?;
+            let text = formats
+                .iter()
+                .find(|f| f.mime.starts_with("text/") || f.mime == "UTF8_STRING")
+                .map(|f| String::from_utf8_lossy(&f.data).into_owned())
+                .unwrap_or_else(|| c.preview.clone());
+            items.push(serde_json::json!({
+                "kind": c.kind.as_str(),
+                "title": c.title,
+                "text": text,
+                "pinned": c.pinned,
+                "source_app": c.source_app,
+                "created_at": c.created_at,
+                "last_used_at": c.last_used_at,
+            }));
+        }
+        let doc = serde_json::json!({
+            "version": 1,
+            "exported_at": now_unix_ms(),
+            "clips": items,
+        });
+        let count = doc["clips"].as_array().map(|a| a.len()).unwrap_or(0);
+        std::fs::write(dest, serde_json::to_string_pretty(&doc)?)
+            .with_context(|| format!("write export {}", dest.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(count)
+    }
+
+    /// Import clips from a JSON file previously created by `export_json`.
+    pub fn import_json(&mut self, src: &Path, config: &Config) -> Result<usize> {
+        let raw_str = std::fs::read_to_string(src)
+            .with_context(|| format!("read import {}", src.display()))?;
+        let doc: serde_json::Value =
+            serde_json::from_str(&raw_str).context("parse import JSON")?;
+        let Some(arr) = doc.get("clips").and_then(|v| v.as_array()) else {
+            bail!("invalid PasteFlow export file: missing clips array");
+        };
+        let mut imported = 0usize;
+        for item in arr {
+            let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let ts = item
+                .get("last_used_at")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_else(now_unix_ms);
+            let raw = RawClip {
+                selection: SelectionKind::Clipboard,
+                formats: vec![RawFormat {
+                    mime: "text/plain;charset=utf-8".to_string(),
+                    data: text.as_bytes().to_vec(),
+                }],
+                source_app: item
+                    .get("source_app")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                owner_pid: None,
+                captured_at_ms: ts,
+            };
+            if let Ok(InsertOutcome::Inserted(rec)) = self.insert_raw_clip(&raw, config) {
+                if item.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let _ = self.set_pinned(rec.id, true);
+                }
+                if let Some(title) = item.get("title").and_then(|v| v.as_str()) {
+                    let _ = self.set_clip_title(rec.id, Some(title));
+                }
+                imported += 1;
+            }
+        }
+        Ok(imported)
     }
 
     /// List all Paste Queue items in FIFO order (`ord ASC`).
@@ -1658,6 +1782,28 @@ mod tests {
         assert_eq!(purged.len(), 1);
         assert!(store.get_clip(c1).unwrap().is_none());
         assert!(store.get_clip(c2).unwrap().is_some());
+    }
+
+    #[test]
+    fn export_and_import_json_roundtrip() {
+        let (dir1, mut store1) = test_store();
+        let cfg = Config::default();
+        let c1 = match store1.insert_raw_clip(&raw_text("https://pasteflow.local/docs", 1000), &cfg).unwrap() {
+            InsertOutcome::Inserted(c) => c.id,
+            _ => unreachable!(),
+        };
+        store1.set_pinned(c1, true).unwrap();
+        store1.set_clip_title(c1, Some("Docs Link")).unwrap();
+
+        let export_path = dir1.path().join("export.json");
+        assert_eq!(store1.export_json(&export_path).unwrap(), 1);
+
+        let (_dir2, mut store2) = test_store();
+        assert_eq!(store2.import_json(&export_path, &cfg).unwrap(), 1);
+        let imported = store2.list_clips(&ClipFilter::recent(10)).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert!(imported[0].pinned);
+        assert_eq!(imported[0].title.as_deref(), Some("Docs Link"));
     }
 
     fn walk_files(dir: &Path) -> usize {

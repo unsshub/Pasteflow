@@ -9,6 +9,7 @@ pub enum TrayCommand {
     ToggleMain,
     ToggleOverlay,
     OpenShortcuts,
+    OpenSettings,
     TogglePause,
     ToggleUniversalPaste,
     PasteNext,
@@ -80,6 +81,15 @@ impl ksni::Tray for PasteFlowTray {
                 icon_name: "preferences-desktop-keyboard-shortcuts-symbolic".to_string(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.send_blocking(TrayCommand::OpenShortcuts);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Settings…".to_string(),
+                icon_name: "emblem-system-symbolic".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.tx.send_blocking(TrayCommand::OpenSettings);
                 }),
                 ..Default::default()
             }

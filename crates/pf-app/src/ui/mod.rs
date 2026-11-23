@@ -2,6 +2,7 @@ pub mod detail;
 pub mod main_window;
 pub mod overlay;
 pub mod queue_view;
+pub mod settings;
 pub mod shortcut_dialog;
 pub mod spaces_dialog;
 

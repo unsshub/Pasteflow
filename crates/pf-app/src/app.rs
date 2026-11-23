@@ -7,6 +7,7 @@ use crate::ui::detail;
 use crate::ui::main_window::{MainWindow, UiAction};
 use crate::ui::overlay::{OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayAction, OverlayWindow};
 use crate::ui::queue_view::QueueUiAction;
+use crate::ui::settings::{self, SettingsAction};
 use crate::ui::shortcut_dialog::{ShortcutSettingsUpdate, show_shortcut_dialog};
 use crate::ui::spaces_dialog::{
     SpaceDialogResult, show_move_to_space_dialog, show_rename_clip_dialog, show_space_editor,
@@ -315,6 +316,7 @@ fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
     // Apply global shortcut provider (X11 grab or Cinnamon custom keybindings)
     let statuses = apply_hotkey_provider(&state);
     *state.hotkey_statuses.borrow_mut() = statuses;
+    settings::apply_theme(&state.config.borrow().theme);
 
     if recovered {
         send_notification(
@@ -481,6 +483,7 @@ fn ensure_main_window(state: &Rc<AppState>) {
     });
 
     let paused = state.config.borrow().paused;
+    let compact = state.config.borrow().compact_density;
     let win = MainWindow::new(
         &state.app,
         Rc::clone(&state.store),
@@ -489,6 +492,7 @@ fn ensure_main_window(state: &Rc<AppState>) {
         paused,
         on_action,
     );
+    win.set_compact_density(compact);
     *state.main_window.borrow_mut() = Some(win);
 }
 
@@ -556,6 +560,140 @@ fn toggle_overlay(
             });
         }
     }
+}
+
+fn open_settings_window(state: &Rc<AppState>) {
+    let cfg = state.config.borrow().clone();
+    let stats = state.store.borrow().stats(&state.paths.db_file()).ok();
+    let st_c = Rc::clone(state);
+    settings::show_settings_window(
+        &state.app,
+        &cfg,
+        &state.paths,
+        stats,
+        Rc::new(move |action| match action {
+            SettingsAction::SaveConfig(next) => {
+                settings::apply_theme(&next.theme);
+                if let Some(ref win) = *st_c.main_window.borrow() {
+                    win.set_compact_density(next.compact_density);
+                }
+                if let Some(ref mut eng) = *st_c.engine.borrow_mut() {
+                    eng.update_config(next.clone());
+                }
+                let _ = next.save(&st_c.paths);
+                *st_c.config.borrow_mut() = next;
+                send_notification(&st_c.app, "settings", "PasteFlow", "Settings saved.");
+            }
+            SettingsAction::SetAutostart(on) => {
+                if autostart::set_autostart_enabled(on).is_ok()
+                    && let Some(ref handle) = *st_c.tray.borrow()
+                {
+                    handle.update(|t| t.autostart = on);
+                }
+            }
+            SettingsAction::OpenShortcuts => open_shortcuts_dialog(&st_c),
+            SettingsAction::ClearUnpinned => handle_ui_action(&st_c, UiAction::ClearUnpinned),
+            SettingsAction::ClearOlderThan7Days => {
+                let cutoff = now_unix_ms() - 7 * 86_400 * 1000;
+                if let Ok(n) = st_c.store.borrow_mut().clear_older_than(cutoff) {
+                    refresh_open_views(&st_c);
+                    send_notification(
+                        &st_c.app,
+                        "clear-7d",
+                        "PasteFlow",
+                        &format!("Removed {n} unpinned clips older than 7 days."),
+                    );
+                }
+            }
+            SettingsAction::ClearAll => {
+                let hashes = st_c.ephemeral.borrow_mut().clear();
+                if let Some(ref mut eng) = *st_c.engine.borrow_mut() {
+                    let _ = eng.clear_clipboard_if_hash_matches(&hashes);
+                }
+                if let Ok(n) = st_c.store.borrow_mut().clear_history(true) {
+                    refresh_open_views(&st_c);
+                    send_notification(
+                        &st_c.app,
+                        "clear-all",
+                        "PasteFlow",
+                        &format!("Cleared all {n} clips and backups."),
+                    );
+                }
+            }
+            SettingsAction::VacuumNow => {
+                if st_c.store.borrow().vacuum_now().is_ok() {
+                    send_notification(&st_c.app, "vacuum", "PasteFlow", "Database vacuumed.");
+                }
+            }
+            SettingsAction::BackupNow => match st_c.store.borrow().backup_now(3) {
+                Ok(p) => send_notification(
+                    &st_c.app,
+                    "backup",
+                    "Backup Created",
+                    &format!("Saved to {}", p.display()),
+                ),
+                Err(e) => warn!(error = %e, "backup failed"),
+            },
+            SettingsAction::ExportJson => {
+                let dest = st_c
+                    .paths
+                    .data_dir
+                    .join(format!("pasteflow-export-{}.json", now_unix_ms() / 1000));
+                match st_c.store.borrow().export_json(&dest) {
+                    Ok(n) => send_notification(
+                        &st_c.app,
+                        "export",
+                        "Export Complete",
+                        &format!("Exported {n} clips to {}", dest.display()),
+                    ),
+                    Err(e) => warn!(error = %e, "export failed"),
+                }
+            }
+            SettingsAction::ImportJson => {
+                // Import most recent `pasteflow-export-*.json` in data_dir if present
+                let mut exports: Vec<std::path::PathBuf> = std::fs::read_dir(&st_c.paths.data_dir)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("pasteflow-export-") && n.ends_with(".json"))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                exports.sort();
+                if let Some(latest) = exports.last() {
+                    let cfg_now = st_c.config.borrow().clone();
+                    match st_c.store.borrow_mut().import_json(latest, &cfg_now) {
+                        Ok(n) => {
+                            refresh_open_views(&st_c);
+                            send_notification(
+                                &st_c.app,
+                                "import",
+                                "Import Complete",
+                                &format!("Imported {n} clips from {}", latest.display()),
+                            );
+                        }
+                        Err(e) => warn!(error = %e, "import failed"),
+                    }
+                } else {
+                    send_notification(
+                        &st_c.app,
+                        "import",
+                        "PasteFlow",
+                        "No pasteflow-export-*.json file found in data folder.",
+                    );
+                }
+            }
+            SettingsAction::OpenDataFolder => {
+                let uri = format!("file://{}", st_c.paths.data_dir.display());
+                let _ = detail::launch_default_uri(&uri);
+            }
+        }),
+    );
 }
 
 fn open_shortcuts_dialog(state: &Rc<AppState>) {
@@ -637,6 +775,7 @@ fn handle_tray_command(state: &Rc<AppState>, cmd: TrayCommand) {
             toggle_overlay(state, None, prev);
         }
         TrayCommand::OpenShortcuts => open_shortcuts_dialog(state),
+        TrayCommand::OpenSettings => open_settings_window(state),
         TrayCommand::TogglePause => toggle_pause(state),
         TrayCommand::ToggleUniversalPaste => {
             let next = !state.queue.borrow().universal_paste;
@@ -741,6 +880,7 @@ fn handle_ui_action(state: &Rc<AppState>, action: UiAction) {
             Err(e) => warn!(error = %e, "failed to clear history"),
         },
         UiAction::OpenShortcuts => open_shortcuts_dialog(state),
+        UiAction::OpenSettings => open_settings_window(state),
         UiAction::CopyText(text) => {
             if let Some(ref mut eng) = *state.engine.borrow_mut() {
                 let _ = eng.own_clipboard(vec![pf_core::model::RawFormat {

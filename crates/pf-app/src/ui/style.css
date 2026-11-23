@@ -62,3 +62,7 @@
 .pf-overlay {
     border: 1px solid alpha(currentColor, 0.22);
 }
+
+.pf-compact .pf-clip-row {
+    padding: 3px 10px;
+}

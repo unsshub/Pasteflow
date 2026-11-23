@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>app.pasteflow.PasteFlow</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>PasteFlow</name>
+  <summary>Native Linux clipboard manager with smart recognition and Paste Queue</summary>
+  <description>
+    <p>
+      PasteFlow is a fast, local-only GTK4 clipboard manager designed for Linux Mint Cinnamon (X11).
+      It captures text, code, links, colors, images, and file lists with zero polling, instant FTS5
+      trigram search, custom Spaces, a sequential Paste Queue, and memory-only storage for sensitive clips.
+    </p>
+  </description>
+  <launchable type="desktop-id">app.pasteflow.PasteFlow.desktop</launchable>
+  <url type="homepage">https://github.com/unsshub/Pasteflow</url>
+  <content_rating type="oars-1.1" />
+</component>

@@ -26,6 +26,7 @@ pub enum UiAction {
     TogglePause,
     ClearUnpinned,
     OpenShortcuts,
+    OpenSettings,
     SaveImageToDownloads(i64),
     OpenImageInViewer(i64),
     OpenUrl(String),
@@ -289,6 +290,12 @@ impl MainWindow {
             .build();
         toolbar.append(&shortcuts_btn);
 
+        let settings_btn = Button::builder()
+            .icon_name("emblem-system-symbolic")
+            .tooltip_text("Settings")
+            .build();
+        toolbar.append(&settings_btn);
+
         let detail_toggle_btn = ToggleButton::builder()
             .icon_name("sidebar-show-right-symbolic")
             .tooltip_text("Toggle detail panel (F9)")
@@ -458,6 +465,12 @@ impl MainWindow {
             let act = Rc::clone(&on_action);
             shortcuts_btn.connect_clicked(move |_| {
                 act(UiAction::OpenShortcuts);
+            });
+        }
+        {
+            let act = Rc::clone(&on_action);
+            settings_btn.connect_clicked(move |_| {
+                act(UiAction::OpenSettings);
             });
         }
 
@@ -644,6 +657,14 @@ impl MainWindow {
             self.window.set_visible(false);
         } else {
             self.present();
+        }
+    }
+
+    pub fn set_compact_density(&self, compact: bool) {
+        if compact {
+            self.window.add_css_class("pf-compact");
+        } else {
+            self.window.remove_css_class("pf-compact");
         }
     }
 

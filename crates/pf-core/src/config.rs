@@ -203,6 +203,8 @@ pub struct Config {
     pub detect_secrets: bool,
     pub secret_expiry_secs: u64,
     pub default_expiry_secs: Option<u64>,
+    pub theme: String,
+    pub compact_density: bool,
 }
 
 impl Default for Config {
@@ -240,6 +242,8 @@ impl Default for Config {
             detect_secrets: true,
             secret_expiry_secs: 30,
             default_expiry_secs: None,
+            theme: "system".to_string(),
+            compact_density: false,
         }
     }
 }
