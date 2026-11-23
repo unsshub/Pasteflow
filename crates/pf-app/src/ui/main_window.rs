@@ -1,14 +1,17 @@
 use crate::ui::detail::{DetailAction, DetailPanel};
 use crate::ui::queue_view::{QueueUiAction, QueueView};
-use crate::ui::{format_bytes, format_relative_time};
+use crate::ui::{
+    ALL_CARD_CLASSES, card_css_class, format_bytes, format_relative_time, kind_display_name,
+    kind_icon_name,
+};
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, DragSource, DropTarget,
-    EventControllerKey, Image, Label, ListBox, ListBoxRow, ListItem, ListView, Orientation, Paned,
-    PolicyType, ScrolledWindow, SearchEntry, Separator, SignalListItemFactory, SingleSelection,
-    Stack, ToggleButton, gdk, pango,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, DragSource, DrawingArea,
+    DropTarget, EventControllerKey, Image, Label, ListBox, ListBoxRow, ListItem, ListView,
+    Orientation, Paned, PolicyType, ScrolledWindow, SearchEntry, Separator, SignalListItemFactory,
+    SingleSelection, Stack, ToggleButton, gdk, pango,
 };
 use pf_core::model::{ClipFilter, ClipKind, ClipRecord, now_unix_ms};
 use pf_store::{EphemeralStore, Store};
@@ -86,6 +89,7 @@ impl MainWindow {
             .default_width(1000)
             .default_height(640)
             .build();
+        window.add_css_class("pf-window");
 
         // Close button hides to tray instead of quitting the resident daemon.
         window.connect_close_request(|w| {
@@ -267,7 +271,8 @@ impl MainWindow {
         toolbar.add_css_class("pf-toolbar");
 
         let search_entry = SearchEntry::new();
-        search_entry.set_placeholder_text(Some("Search clipboard history… (Ctrl+F)"));
+        search_entry.set_placeholder_text(Some("Search Clipboard… (Ctrl+F)"));
+        search_entry.add_css_class("pf-search");
         search_entry.set_hexpand(true);
         toolbar.append(&search_entry);
 
@@ -316,6 +321,7 @@ impl MainWindow {
         let selection = SingleSelection::new(Some(model.clone()));
         let factory = build_row_factory(thumbs_dir, Rc::clone(&on_action));
         let list_view = ListView::new(Some(selection.clone()), Some(factory));
+        list_view.add_css_class("pf-card-list");
         list_view.set_single_click_activate(false);
 
         // Double-click / Enter on a row copies it back to CLIPBOARD
@@ -415,13 +421,9 @@ impl MainWindow {
         }
 
         // Bottom status bar
-        content_vbox.append(&Separator::new(Orientation::Horizontal));
         let status_label = Label::new(Some("0 clips"));
         status_label.set_xalign(0.0);
-        status_label.set_margin_start(12);
-        status_label.set_margin_top(4);
-        status_label.set_margin_bottom(4);
-        status_label.add_css_class("pf-clip-meta");
+        status_label.add_css_class("pf-status-bar");
         content_vbox.append(&status_label);
 
         root_hbox.append(&content_vbox);
@@ -828,8 +830,12 @@ fn reload_list(
 }
 
 struct RowWidgets {
+    card: GtkBox,
     clip_id: Rc<Cell<i64>>,
     thumb: Image,
+    swatch: DrawingArea,
+    swatch_rgba: Rc<Cell<(f64, f64, f64, f64)>>,
+    chip_icon: Image,
     kind_badge: Label,
     preview: Label,
     meta: Label,
@@ -853,12 +859,33 @@ fn build_row_factory(
             row_box.add_css_class("pf-clip-row");
 
             let thumb = Image::new();
-            thumb.set_pixel_size(40);
+            thumb.set_pixel_size(44);
             thumb.set_valign(Align::Center);
+            thumb.add_css_class("pf-thumb-frame");
+            thumb.set_visible(false);
             row_box.append(&thumb);
 
-            let text_col = GtkBox::new(Orientation::Vertical, 3);
+            let text_col = GtkBox::new(Orientation::Vertical, 6);
             text_col.set_hexpand(true);
+
+            let top_line = GtkBox::new(Orientation::Horizontal, 8);
+            let swatch_rgba = Rc::new(Cell::new((0.5, 0.5, 0.5, 1.0)));
+            let swatch = DrawingArea::new();
+            swatch.set_content_width(18);
+            swatch.set_content_height(18);
+            swatch.set_valign(Align::Center);
+            swatch.add_css_class("pf-color-swatch");
+            swatch.set_visible(false);
+            {
+                let rgba_c = Rc::clone(&swatch_rgba);
+                swatch.set_draw_func(move |_a, cr, w, h| {
+                    let (r, g, b, a) = rgba_c.get();
+                    cr.set_source_rgba(r, g, b, a);
+                    cr.rectangle(0.0, 0.0, f64::from(w), f64::from(h));
+                    let _ = cr.fill();
+                });
+            }
+            top_line.append(&swatch);
 
             let preview = Label::new(None);
             preview.set_xalign(0.0);
@@ -868,9 +895,18 @@ fn build_row_factory(
             preview.set_wrap(true);
             preview.set_wrap_mode(pango::WrapMode::WordChar);
             preview.add_css_class("pf-clip-preview");
-            text_col.append(&preview);
+            preview.set_hexpand(true);
+            top_line.append(&preview);
+            text_col.append(&top_line);
 
-            let meta_row = GtkBox::new(Orientation::Horizontal, 8);
+            let meta_row = GtkBox::new(Orientation::Horizontal, 6);
+            let chip_box = GtkBox::new(Orientation::Horizontal, 0);
+            chip_box.add_css_class("pf-icon-chip");
+            let chip_icon = Image::new();
+            chip_icon.set_pixel_size(13);
+            chip_box.append(&chip_icon);
+            meta_row.append(&chip_box);
+
             let kind_badge = Label::new(None);
             kind_badge.add_css_class("pf-kind-badge");
             meta_row.append(&kind_badge);
@@ -892,6 +928,7 @@ fn build_row_factory(
                 .has_frame(false)
                 .valign(Align::Center)
                 .build();
+            pin_btn.add_css_class("pf-row-action");
             {
                 let id_c = Rc::clone(&clip_id);
                 let act = Rc::clone(&on_action_setup);
@@ -909,12 +946,13 @@ fn build_row_factory(
                 .has_frame(false)
                 .valign(Align::Center)
                 .build();
+            copy_btn.add_css_class("pf-row-action");
             {
                 let id_c = Rc::clone(&clip_id);
                 let act = Rc::clone(&on_action_setup);
                 copy_btn.connect_clicked(move |_| {
                     let id = id_c.get();
-                    if id > 0 {
+                    if id != 0 {
                         act(UiAction::CopyClip(id));
                     }
                 });
@@ -926,12 +964,13 @@ fn build_row_factory(
                 .has_frame(false)
                 .valign(Align::Center)
                 .build();
+            del_btn.add_css_class("pf-row-action");
             {
                 let id_c = Rc::clone(&clip_id);
                 let act = Rc::clone(&on_action_setup);
                 del_btn.connect_clicked(move |_| {
                     let id = id_c.get();
-                    if id > 0 {
+                    if id != 0 {
                         act(UiAction::DeleteClip(id));
                     }
                 });
@@ -943,6 +982,7 @@ fn build_row_factory(
                 .has_frame(false)
                 .valign(Align::Center)
                 .build();
+            queue_btn.add_css_class("pf-row-action");
             {
                 let id_c = Rc::clone(&clip_id);
                 let act = Rc::clone(&on_action_setup);
@@ -976,8 +1016,12 @@ fn build_row_factory(
             row_box.add_controller(drag_src);
 
             let widgets = Rc::new(RowWidgets {
+                card: row_box.clone(),
                 clip_id,
                 thumb,
+                swatch,
+                swatch_rgba,
+                chip_icon,
                 kind_badge,
                 preview,
                 meta,
@@ -1016,8 +1060,14 @@ fn build_row_factory(
             return;
         };
 
+        for cls in ALL_CARD_CLASSES {
+            w.card.remove_css_class(cls);
+        }
+        w.card.add_css_class(card_css_class(clip.kind, clip.id < 0));
+
         w.clip_id.set(clip.id);
-        w.kind_badge.set_text(&clip.kind.as_str().to_ascii_uppercase());
+        w.chip_icon.set_icon_name(Some(kind_icon_name(clip.kind)));
+        w.kind_badge.set_text(kind_display_name(clip.kind));
         if let Some(ref title) = clip.title {
             w.preview.set_text(&format!("{title}\n{}", clip.preview));
         } else {
@@ -1056,7 +1106,23 @@ fn build_row_factory(
             w.pin_btn.remove_css_class("pf-pin-active");
         }
 
-        // Load thumbnail for image clips or symbolic icon for other kinds
+        // Live color swatch for Color clips
+        if clip.kind == ClipKind::Color
+            && let Some(col) = pf_core::detect::color::parse_color(&clip.preview)
+        {
+            w.swatch_rgba.set((
+                f64::from(col.r) / 255.0,
+                f64::from(col.g) / 255.0,
+                f64::from(col.b) / 255.0,
+                f64::from(col.a) / 255.0,
+            ));
+            w.swatch.set_visible(true);
+            w.swatch.queue_draw();
+        } else {
+            w.swatch.set_visible(false);
+        }
+
+        // Show thumbnail only for Image clips
         if clip.kind == ClipKind::Image
             && let Some(ref im) = clip.image
             && let Some(ref tkey) = im.thumb_key
@@ -1064,20 +1130,11 @@ fn build_row_factory(
             let path = thumbs_dir.join(tkey);
             if path.exists() {
                 w.thumb.set_from_file(Some(&path));
-            } else {
-                w.thumb.set_icon_name(Some("image-x-generic-symbolic"));
+                w.thumb.set_visible(true);
+                return;
             }
-        } else {
-            let icon = match clip.kind {
-                ClipKind::Image => "image-x-generic-symbolic",
-                ClipKind::Files => "folder-documents-symbolic",
-                ClipKind::Code => "utilities-terminal-symbolic",
-                ClipKind::Url => "insert-link-symbolic",
-                ClipKind::Color => "applications-graphics-symbolic",
-                _ => "text-x-generic-symbolic",
-            };
-            w.thumb.set_icon_name(Some(icon));
         }
+        w.thumb.set_visible(false);
     });
 
     factory

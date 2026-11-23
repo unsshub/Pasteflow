@@ -81,6 +81,7 @@ impl DetailPanel {
     pub fn new(store: Rc<RefCell<Store>>, on_action: Rc<dyn Fn(DetailAction)>) -> Self {
         let root = GtkBox::new(Orientation::Vertical, 0);
         root.set_width_request(300);
+        root.add_css_class("pf-detail-pane");
 
         let current_clip_id = Rc::new(Cell::new(None));
         let suppress_lang_signal = Rc::new(Cell::new(false));

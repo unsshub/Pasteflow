@@ -8,8 +8,67 @@ pub mod spaces_dialog;
 
 use gtk4::CssProvider;
 use gtk4::gdk::Display;
+use pf_core::model::ClipKind;
 
 const STYLE_CSS: &str = include_str!("style.css");
+
+pub const ALL_CARD_CLASSES: &[&str] = &[
+    "pf-card-text",
+    "pf-card-code",
+    "pf-card-url",
+    "pf-card-color",
+    "pf-card-email",
+    "pf-card-phone",
+    "pf-card-number",
+    "pf-card-image",
+    "pf-card-files",
+    "pf-card-ephemeral",
+];
+
+pub fn card_css_class(kind: ClipKind, is_ephemeral: bool) -> &'static str {
+    if is_ephemeral {
+        return "pf-card-ephemeral";
+    }
+    match kind {
+        ClipKind::Text => "pf-card-text",
+        ClipKind::Code => "pf-card-code",
+        ClipKind::Url => "pf-card-url",
+        ClipKind::Color => "pf-card-color",
+        ClipKind::Email => "pf-card-email",
+        ClipKind::Phone => "pf-card-phone",
+        ClipKind::Number => "pf-card-number",
+        ClipKind::Image => "pf-card-image",
+        ClipKind::Files => "pf-card-files",
+    }
+}
+
+pub fn kind_display_name(kind: ClipKind) -> &'static str {
+    match kind {
+        ClipKind::Text => "Text",
+        ClipKind::Code => "Code",
+        ClipKind::Url => "Links",
+        ClipKind::Color => "Colors",
+        ClipKind::Email => "Email",
+        ClipKind::Phone => "Phone",
+        ClipKind::Number => "Numbers",
+        ClipKind::Image => "Images",
+        ClipKind::Files => "Files",
+    }
+}
+
+pub fn kind_icon_name(kind: ClipKind) -> &'static str {
+    match kind {
+        ClipKind::Image => "image-x-generic-symbolic",
+        ClipKind::Files => "folder-documents-symbolic",
+        ClipKind::Code => "utilities-terminal-symbolic",
+        ClipKind::Url => "insert-link-symbolic",
+        ClipKind::Color => "applications-graphics-symbolic",
+        ClipKind::Email => "mail-unread-symbolic",
+        ClipKind::Phone => "call-start-symbolic",
+        ClipKind::Number => "accessories-calculator-symbolic",
+        ClipKind::Text => "edit-paste-symbolic",
+    }
+}
 
 /// Load PasteFlow's lightweight stylesheet onto the default GDK display.
 pub fn install_css() {
