@@ -36,22 +36,69 @@ window.pf-overlay {
     background-color: transparent;
 }
 
-.pf-sidebar list > row {
+.pf-sidebar list > row,
+.pf-sidebar list.navigation-sidebar > row {
     border-radius: 10px;
     margin: 1px 2px;
     padding: 4px 6px;
     color: #2B2F36;
+    background-color: transparent;
 }
 
-.pf-sidebar list > row:hover {
-    background-color: rgba(31, 35, 40, 0.06);
+.pf-sidebar list > row label,
+.pf-sidebar list > row image,
+.pf-sidebar list.navigation-sidebar > row label,
+.pf-sidebar list.navigation-sidebar > row image {
+    color: #2B2F36;
 }
 
-.pf-sidebar list > row:selected {
+.pf-sidebar list > row:hover,
+.pf-sidebar list.navigation-sidebar > row:hover {
+    background-color: rgba(31, 35, 40, 0.07);
+}
+
+.pf-sidebar list > row:selected,
+.pf-sidebar list.navigation-sidebar > row:selected {
     background-color: #FFFFFF;
     color: #1B1E23;
     font-weight: 700;
+    border: 1.5px solid #D4CFC2;
+}
+
+.pf-sidebar list > row:selected label,
+.pf-sidebar list > row:selected image,
+.pf-sidebar list > row:selected button,
+.pf-sidebar list.navigation-sidebar > row:selected label,
+.pf-sidebar list.navigation-sidebar > row:selected image,
+.pf-sidebar list.navigation-sidebar > row:selected button {
+    color: #1B1E23;
+}
+
+/* Ensure toolbar buttons & search icons stay crisp dark on the warm cream canvas
+   even when the host desktop uses a dark GTK theme (e.g. Mint-Y-Dark-Orange) */
+.pf-toolbar button,
+.pf-toolbar togglebutton {
+    color: #2B2F36;
+    background-color: #FFFFFF;
+    background-image: none;
     border: 1px solid #DFDBD0;
+    border-radius: 10px;
+}
+
+.pf-toolbar button:hover,
+.pf-toolbar togglebutton:hover {
+    background-color: #EFECE3;
+}
+
+.pf-toolbar togglebutton:checked {
+    background-color: #E3DFD3;
+    border-color: #BDB7A8;
+    color: #15181C;
+}
+
+.pf-search text,
+.pf-search image {
+    color: #1F2328;
 }
 
 /* Top search & toolbar */
