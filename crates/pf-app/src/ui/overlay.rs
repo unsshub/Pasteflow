@@ -386,6 +386,14 @@ impl OverlayWindow {
         }
     }
 
+    pub fn set_dark_theme(&self, dark: bool) {
+        if dark {
+            self.window.add_css_class("pf-dark");
+        } else {
+            self.window.remove_css_class("pf-dark");
+        }
+    }
+
     pub fn is_visible(&self) -> bool {
         self.window.is_visible()
     }

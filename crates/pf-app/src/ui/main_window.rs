@@ -30,6 +30,7 @@ pub enum UiAction {
     ClearUnpinned,
     OpenShortcuts,
     OpenSettings,
+    ToggleDarkTheme,
     SaveImageToDownloads(i64),
     OpenImageInViewer(i64),
     OpenUrl(String),
@@ -67,6 +68,7 @@ pub struct MainWindow {
     spaces_ids: Rc<RefCell<Vec<i64>>>,
     paused_banner: Label,
     pause_btn: ToggleButton,
+    theme_btn: Button,
     status_label: Label,
     nav_state: Rc<RefCell<NavSelection>>,
     store: Rc<RefCell<Store>>,
@@ -306,6 +308,12 @@ impl MainWindow {
             .build();
         toolbar.append(&settings_btn);
 
+        let theme_btn = Button::builder()
+            .icon_name("weather-clear-night-symbolic")
+            .tooltip_text("Toggle Dark / Light theme")
+            .build();
+        toolbar.append(&theme_btn);
+
         let detail_toggle_btn = ToggleButton::builder()
             .icon_name("sidebar-show-right-symbolic")
             .tooltip_text("Toggle detail panel (F9)")
@@ -449,6 +457,7 @@ impl MainWindow {
             spaces_ids: Rc::clone(&spaces_ids),
             paused_banner,
             pause_btn,
+            theme_btn: theme_btn.clone(),
             status_label,
             nav_state,
             store,
@@ -479,6 +488,12 @@ impl MainWindow {
             let act = Rc::clone(&on_action);
             settings_btn.connect_clicked(move |_| {
                 act(UiAction::OpenSettings);
+            });
+        }
+        {
+            let act = Rc::clone(&on_action);
+            theme_btn.connect_clicked(move |_| {
+                act(UiAction::ToggleDarkTheme);
             });
         }
 
@@ -665,6 +680,18 @@ impl MainWindow {
             self.window.set_visible(false);
         } else {
             self.present();
+        }
+    }
+
+    pub fn set_dark_theme(&self, dark: bool) {
+        if dark {
+            self.window.add_css_class("pf-dark");
+            self.theme_btn.set_icon_name("weather-clear-symbolic");
+            self.theme_btn.set_tooltip_text(Some("Switch to Light theme"));
+        } else {
+            self.window.remove_css_class("pf-dark");
+            self.theme_btn.set_icon_name("weather-clear-night-symbolic");
+            self.theme_btn.set_tooltip_text(Some("Switch to Dark theme"));
         }
     }
 

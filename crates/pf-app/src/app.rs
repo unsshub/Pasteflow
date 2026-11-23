@@ -277,7 +277,14 @@ fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
     let (tray_tx, tray_rx) = async_channel::unbounded::<TrayCommand>();
     let autostart_on = autostart::is_autostart_enabled();
     let initial_queue_count = store.queue_count().unwrap_or(0);
-    let tray_handle = match tray::spawn_tray(tray_tx, config.paused, autostart_on, initial_queue_count) {
+    let initial_dark = is_dark_mode(&config.theme);
+    let tray_handle = match tray::spawn_tray(
+        tray_tx,
+        config.paused,
+        autostart_on,
+        initial_dark,
+        initial_queue_count,
+    ) {
         Ok(h) => Some(h),
         Err(e) => {
             warn!(error = %e, "tray icon unavailable; continuing without SNI tray");
@@ -525,6 +532,7 @@ fn ensure_main_window(state: &Rc<AppState>) {
 
     let paused = state.config.borrow().paused;
     let compact = state.config.borrow().compact_density;
+    let dark = is_dark_mode(&state.config.borrow().theme);
     let win = MainWindow::new(
         &state.app,
         Rc::clone(&state.store),
@@ -534,6 +542,7 @@ fn ensure_main_window(state: &Rc<AppState>) {
         on_action,
     );
     win.set_compact_density(compact);
+    win.set_dark_theme(dark);
     *state.main_window.borrow_mut() = Some(win);
 }
 
@@ -551,6 +560,7 @@ fn ensure_overlay_window(state: &Rc<AppState>) {
         state.paths.thumbs_dir(),
         on_action,
     );
+    ov.set_dark_theme(is_dark_mode(&state.config.borrow().theme));
     *state.overlay_window.borrow_mut() = Some(ov);
 }
 
@@ -624,6 +634,8 @@ fn open_settings_window(state: &Rc<AppState>) {
         Rc::new(move |action| match action {
             SettingsAction::SaveConfig(next) => {
                 settings::apply_theme(&next.theme);
+                let dark = is_dark_mode(&next.theme);
+                sync_dark_theme_ui(&st_c, dark);
                 if let Some(ref win) = *st_c.main_window.borrow() {
                     win.set_compact_density(next.compact_density);
                 }
@@ -828,6 +840,7 @@ fn handle_tray_command(state: &Rc<AppState>, cmd: TrayCommand) {
         }
         TrayCommand::OpenShortcuts => open_shortcuts_dialog(state),
         TrayCommand::OpenSettings => open_settings_window(state),
+        TrayCommand::ToggleDarkTheme => toggle_dark_theme(state),
         TrayCommand::TogglePause => toggle_pause(state),
         TrayCommand::ToggleUniversalPaste => {
             let next = !state.queue.borrow().universal_paste;
@@ -937,6 +950,7 @@ fn handle_ui_action(state: &Rc<AppState>, action: UiAction) {
         },
         UiAction::OpenShortcuts => open_shortcuts_dialog(state),
         UiAction::OpenSettings => open_settings_window(state),
+        UiAction::ToggleDarkTheme => toggle_dark_theme(state),
         UiAction::CopyText(text) => {
             if let Some(ref mut eng) = *state.engine.borrow_mut() {
                 let _ = eng.own_clipboard(vec![pf_core::model::RawFormat {
@@ -1301,6 +1315,34 @@ fn open_image_in_viewer(state: &Rc<AppState>, id: i64) {
             warn!(error = %e, "failed to open image in default viewer");
         }
     }
+}
+
+fn is_dark_mode(theme: &str) -> bool {
+    theme.eq_ignore_ascii_case("dark")
+}
+
+fn sync_dark_theme_ui(state: &Rc<AppState>, dark: bool) {
+    if let Some(ref win) = *state.main_window.borrow() {
+        win.set_dark_theme(dark);
+    }
+    if let Some(ref ov) = *state.overlay_window.borrow() {
+        ov.set_dark_theme(dark);
+    }
+    if let Some(ref handle) = *state.tray.borrow() {
+        handle.update(|t| t.dark_theme = dark);
+    }
+}
+
+fn toggle_dark_theme(state: &Rc<AppState>) {
+    let next_dark = {
+        let mut cfg = state.config.borrow_mut();
+        let next = !is_dark_mode(&cfg.theme);
+        cfg.theme = if next { "dark" } else { "light" }.to_string();
+        let _ = cfg.save(&state.paths);
+        settings::apply_theme(&cfg.theme);
+        next
+    };
+    sync_dark_theme_ui(state, next_dark);
 }
 
 fn toggle_pause(state: &Rc<AppState>) {

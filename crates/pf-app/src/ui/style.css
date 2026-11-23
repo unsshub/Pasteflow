@@ -373,3 +373,245 @@ listview.pf-card-list > row:selected .pf-clip-row {
     padding: 6px 12px;
     border-radius: 10px;
 }
+
+/* ============================================================================
+   Dark Theme (.pf-dark) — Warm charcoal canvas with rich jewel-tinted cards
+   ============================================================================ */
+
+window.pf-window.pf-dark,
+window.pf-overlay.pf-dark {
+    background-color: #181A1F;
+    color: #ECEFF4;
+}
+
+window.pf-overlay.pf-dark {
+    border-color: #343946;
+}
+
+.pf-dark .pf-sidebar {
+    background-color: #13151A;
+}
+
+.pf-dark .pf-brand {
+    color: #F4F6FA;
+}
+
+.pf-dark .pf-section-label {
+    color: #8890A0;
+}
+
+.pf-dark .pf-sidebar list > row,
+.pf-dark .pf-sidebar list.navigation-sidebar > row {
+    color: #CFD5E0;
+}
+
+.pf-dark .pf-sidebar list > row label,
+.pf-dark .pf-sidebar list > row image,
+.pf-dark .pf-sidebar list.navigation-sidebar > row label,
+.pf-dark .pf-sidebar list.navigation-sidebar > row image {
+    color: #CFD5E0;
+}
+
+.pf-dark .pf-sidebar list > row:hover,
+.pf-dark .pf-sidebar list.navigation-sidebar > row:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+.pf-dark .pf-sidebar list > row:selected,
+.pf-dark .pf-sidebar list.navigation-sidebar > row:selected {
+    background-color: #252934;
+    border-color: #3D4457;
+    color: #FFFFFF;
+}
+
+.pf-dark .pf-sidebar list > row:selected label,
+.pf-dark .pf-sidebar list > row:selected image,
+.pf-dark .pf-sidebar list > row:selected button,
+.pf-dark .pf-sidebar list.navigation-sidebar > row:selected label,
+.pf-dark .pf-sidebar list.navigation-sidebar > row:selected image,
+.pf-dark .pf-sidebar list.navigation-sidebar > row:selected button {
+    color: #FFFFFF;
+}
+
+.pf-dark .pf-toolbar,
+.pf-dark .pf-filter-bar,
+.pf-dark listview.pf-card-list {
+    background-color: #181A1F;
+}
+
+.pf-dark .pf-search {
+    background-color: #22252E;
+    color: #F2F4F8;
+    border-color: #353B49;
+}
+
+.pf-dark .pf-search text,
+.pf-dark .pf-search image {
+    color: #F2F4F8;
+}
+
+.pf-dark .pf-toolbar button,
+.pf-dark .pf-toolbar togglebutton {
+    color: #DCE1EB;
+    background-color: #22252E;
+    border-color: #353B49;
+}
+
+.pf-dark .pf-toolbar button:hover,
+.pf-dark .pf-toolbar togglebutton:hover {
+    background-color: #2C303C;
+}
+
+.pf-dark .pf-toolbar togglebutton:checked {
+    background-color: #373D4D;
+    border-color: #566078;
+    color: #FFFFFF;
+}
+
+.pf-dark button.pf-filter-pill {
+    background-color: #22252E;
+    color: #DCE1EB;
+    border-color: #353B49;
+}
+
+.pf-dark button.pf-filter-pill:hover {
+    background-color: #2B2F3B;
+}
+
+.pf-dark button.pf-filter-pill.pf-pill-active {
+    background-color: #292E3B;
+    border: 1.5px dashed #8F99AD;
+    color: #FFFFFF;
+}
+
+.pf-dark .pf-clip-row {
+    color: #F2F4F8;
+    background-color: #22252E;
+}
+
+.pf-dark listview.pf-card-list > row:selected .pf-clip-row {
+    border-color: #E2E6F0;
+}
+
+.pf-dark .pf-card-image {
+    background-color: #27301A;
+    border-color: #495C2C;
+}
+.pf-dark .pf-card-image .pf-kind-badge,
+.pf-dark .pf-card-image .pf-icon-chip {
+    background-color: #394822;
+    color: #E2F59B;
+}
+
+.pf-dark .pf-card-color {
+    background-color: #341F2B;
+    border-color: #6B3651;
+}
+.pf-dark .pf-card-color .pf-kind-badge,
+.pf-dark .pf-card-color .pf-icon-chip {
+    background-color: #4E293D;
+    color: #F9BBD7;
+}
+
+.pf-dark .pf-card-url {
+    background-color: #1A2938;
+    border-color: #33587A;
+}
+.pf-dark .pf-card-url .pf-kind-badge,
+.pf-dark .pf-card-url .pf-icon-chip {
+    background-color: #243E57;
+    color: #AED9FA;
+}
+
+.pf-dark .pf-card-email,
+.pf-dark .pf-card-phone {
+    background-color: #1A2F24;
+    border-color: #2F6348;
+}
+.pf-dark .pf-card-email .pf-kind-badge,
+.pf-dark .pf-card-email .pf-icon-chip,
+.pf-dark .pf-card-phone .pf-kind-badge,
+.pf-dark .pf-card-phone .pf-icon-chip {
+    background-color: #234634;
+    color: #B0ECC9;
+}
+
+.pf-dark .pf-card-text {
+    background-color: #342122;
+    border-color: #6E3A3C;
+}
+.pf-dark .pf-card-text .pf-kind-badge,
+.pf-dark .pf-card-text .pf-icon-chip {
+    background-color: #4E2C2E;
+    color: #FDC8C8;
+}
+
+.pf-dark .pf-card-number {
+    background-color: #1D2A36;
+    border-color: #385770;
+}
+.pf-dark .pf-card-number .pf-kind-badge,
+.pf-dark .pf-card-number .pf-icon-chip {
+    background-color: #293F52;
+    color: #C4E2F7;
+}
+
+.pf-dark .pf-card-code {
+    background-color: #282138;
+    border-color: #52417A;
+}
+.pf-dark .pf-card-code .pf-kind-badge,
+.pf-dark .pf-card-code .pf-icon-chip {
+    background-color: #3A2F57;
+    color: #DCCDFA;
+}
+
+.pf-dark .pf-card-files {
+    background-color: #342B1B;
+    border-color: #6B542E;
+}
+.pf-dark .pf-card-files .pf-kind-badge,
+.pf-dark .pf-card-files .pf-icon-chip {
+    background-color: #4D3D22;
+    color: #FBE2B0;
+}
+
+.pf-dark .pf-card-ephemeral {
+    background-color: #262523;
+    border-color: #4B4842;
+}
+.pf-dark .pf-card-ephemeral .pf-kind-badge,
+.pf-dark .pf-card-ephemeral .pf-icon-chip {
+    background-color: #3B3832;
+    color: #E2DACB;
+}
+
+.pf-dark .pf-clip-preview {
+    color: #F4F6FA;
+}
+
+.pf-dark .pf-clip-meta {
+    color: #A6AEBD;
+}
+
+.pf-dark .pf-row-action {
+    color: #CFD5E0;
+}
+
+.pf-dark .pf-row-action:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+}
+
+.pf-dark .pf-detail-pane {
+    background-color: #1D2027;
+    color: #ECEFF4;
+}
+
+.pf-dark .pf-status-bar {
+    background-color: #14161B;
+    color: #939AA8;
+}
+
+.pf-dark .pf-empty-state {
+    color: #8890A0;
+}

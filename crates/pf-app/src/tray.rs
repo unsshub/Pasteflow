@@ -10,6 +10,7 @@ pub enum TrayCommand {
     ToggleOverlay,
     OpenShortcuts,
     OpenSettings,
+    ToggleDarkTheme,
     TogglePause,
     ToggleUniversalPaste,
     PasteNext,
@@ -23,6 +24,7 @@ pub struct PasteFlowTray {
     tx: async_channel::Sender<TrayCommand>,
     pub paused: bool,
     pub autostart: bool,
+    pub dark_theme: bool,
     pub universal_paste: bool,
     pub queue_count: usize,
 }
@@ -134,6 +136,15 @@ impl ksni::Tray for PasteFlowTray {
             }
             .into(),
             CheckmarkItem {
+                label: "Dark Theme".to_string(),
+                checked: self.dark_theme,
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.tx.send_blocking(TrayCommand::ToggleDarkTheme);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            CheckmarkItem {
                 label: "Launch at Startup".to_string(),
                 checked: self.autostart,
                 activate: Box::new(|tray: &mut Self| {
@@ -169,12 +180,14 @@ pub fn spawn_tray(
     tx: async_channel::Sender<TrayCommand>,
     paused: bool,
     autostart: bool,
+    dark_theme: bool,
     queue_count: usize,
 ) -> Result<ksni::blocking::Handle<PasteFlowTray>> {
     let tray = PasteFlowTray {
         tx,
         paused,
         autostart,
+        dark_theme,
         universal_paste: false,
         queue_count,
     };
