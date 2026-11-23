@@ -99,9 +99,10 @@ impl MainWindow {
 
         let root_hbox = GtkBox::new(Orientation::Horizontal, 0);
 
-        // --- Sidebar (220 px) ---
+        // --- Sidebar (fixed 220 px, never expands when content is empty) ---
         let sidebar_box = GtkBox::new(Orientation::Vertical, 4);
         sidebar_box.set_width_request(220);
+        sidebar_box.set_hexpand(false);
         sidebar_box.add_css_class("pf-sidebar");
 
         let brand = Label::new(Some("PasteFlow"));
@@ -254,6 +255,10 @@ impl MainWindow {
         let nav_scroll = ScrolledWindow::builder()
             .hscrollbar_policy(PolicyType::Never)
             .vexpand(true)
+            .hexpand(false)
+            .min_content_width(220)
+            .max_content_width(220)
+            .propagate_natural_width(false)
             .child(&nav_scroll_inner)
             .build();
         sidebar_box.append(&nav_scroll);
@@ -353,6 +358,7 @@ impl MainWindow {
         let stack = Stack::new();
         stack.set_vexpand(true);
         stack.set_hexpand(true);
+        stack.set_hhomogeneous(true);
         stack.add_named(&scrolled, Some("list"));
         stack.add_named(&empty_label, Some("empty"));
 
