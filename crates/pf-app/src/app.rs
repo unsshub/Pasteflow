@@ -1,10 +1,12 @@
 use crate::autostart;
 use crate::cinnamon_keys;
+use crate::queue::QueueController;
 use crate::tray::{self, PasteFlowTray, TrayCommand};
 use crate::ui;
 use crate::ui::detail;
 use crate::ui::main_window::{MainWindow, UiAction};
 use crate::ui::overlay::{OVERLAY_HEIGHT, OVERLAY_WIDTH, OverlayAction, OverlayWindow};
+use crate::ui::queue_view::QueueUiAction;
 use crate::ui::shortcut_dialog::{ShortcutSettingsUpdate, show_shortcut_dialog};
 use anyhow::Result;
 use gtk4::gio::{self, ApplicationFlags};
@@ -28,6 +30,7 @@ struct AppState {
     config: RefCell<Config>,
     store: Rc<RefCell<Store>>,
     engine: RefCell<Option<X11Engine>>,
+    queue: RefCell<QueueController>,
     x11_source_id: Cell<Option<u32>>,
     hotkey_statuses: RefCell<Vec<HotkeyStatus>>,
     tray: RefCell<Option<ksni::blocking::Handle<PasteFlowTray>>>,
@@ -154,13 +157,10 @@ pub fn run_gui(raw_args: &[String]) -> Result<()> {
             }
 
             if paste_next {
-                info!("--paste-next invoked (Paste Queue lands in M5)");
-                send_notification(
-                    app,
-                    "paste-next",
-                    "PasteFlow",
-                    "Paste Queue will be enabled in M5.",
-                );
+                if let Some(st) = state_cmd.borrow().as_ref() {
+                    let prev = st.engine.borrow().as_ref().and_then(|e| e.active_window());
+                    trigger_paste_next(st, prev);
+                }
                 return 0.into();
             }
 
@@ -267,7 +267,8 @@ fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
 
     let (tray_tx, tray_rx) = async_channel::unbounded::<TrayCommand>();
     let autostart_on = autostart::is_autostart_enabled();
-    let tray_handle = match tray::spawn_tray(tray_tx, config.paused, autostart_on) {
+    let initial_queue_count = store.queue_count().unwrap_or(0);
+    let tray_handle = match tray::spawn_tray(tray_tx, config.paused, autostart_on, initial_queue_count) {
         Ok(h) => Some(h),
         Err(e) => {
             warn!(error = %e, "tray icon unavailable; continuing without SNI tray");
@@ -291,6 +292,7 @@ fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
         config: RefCell::new(config),
         store: Rc::new(RefCell::new(store)),
         engine: RefCell::new(engine),
+        queue: RefCell::new(QueueController::default()),
         x11_source_id: Cell::new(None),
         hotkey_statuses: RefCell::new(Vec::new()),
         tray: RefCell::new(tray_handle),
@@ -398,10 +400,18 @@ fn pump_x11_events(state: &Rc<AppState>) {
                             hash = %rec.short_hash(),
                             "captured clip"
                         );
+                        if state.queue.borrow().universal_paste {
+                            let _ = state.store.borrow_mut().queue_enqueue(rec.id);
+                            sync_queue_indicators(state);
+                        }
                         store_changed = true;
                     }
                     Ok(InsertOutcome::Deduplicated(rec)) => {
                         info!(id = rec.id, copy_count = rec.copy_count, "deduplicated clip");
+                        if state.queue.borrow().universal_paste {
+                            let _ = state.store.borrow_mut().queue_enqueue(rec.id);
+                            sync_queue_indicators(state);
+                        }
                         store_changed = true;
                     }
                     Ok(InsertOutcome::Skipped(_)) => {}
@@ -409,8 +419,14 @@ fn pump_x11_events(state: &Rc<AppState>) {
                 }
             }
             ClipboardEvent::OwnerVanished { .. } => {}
-            ClipboardEvent::SelectionServed { target } => {
-                info!(target = %target, "served clipboard target");
+            ClipboardEvent::SelectionServed {
+                target,
+                is_clipboard_manager,
+            } => {
+                info!(target = %target, is_clipboard_manager, "served clipboard target");
+                if !is_clipboard_manager {
+                    confirm_in_flight_paste(state);
+                }
             }
             ClipboardEvent::HotkeyPressed {
                 action,
@@ -421,13 +437,7 @@ fn pump_x11_events(state: &Rc<AppState>) {
                     toggle_overlay(state, Some(timestamp), previous_window);
                 }
                 HotkeyAction::PasteNext => {
-                    info!("PasteNext hotkey pressed (Paste Queue lands in M5)");
-                    send_notification(
-                        &state.app,
-                        "paste-next",
-                        "PasteFlow",
-                        "Paste Queue will be enabled in M5.",
-                    );
+                    trigger_paste_next(state, previous_window);
                 }
             },
         }
@@ -609,6 +619,7 @@ fn handle_overlay_action(state: &Rc<AppState>, action: OverlayAction) {
             });
         }
         OverlayAction::TogglePin(id) => handle_ui_action(state, UiAction::TogglePin(id)),
+        OverlayAction::AddToQueue(id) => handle_ui_action(state, UiAction::AddToQueue(id)),
         OverlayAction::DeleteClip(id) => handle_ui_action(state, UiAction::DeleteClip(id)),
         OverlayAction::Closed { previous_window } => {
             if let Some(prev) = previous_window
@@ -630,6 +641,15 @@ fn handle_tray_command(state: &Rc<AppState>, cmd: TrayCommand) {
         }
         TrayCommand::OpenShortcuts => open_shortcuts_dialog(state),
         TrayCommand::TogglePause => toggle_pause(state),
+        TrayCommand::ToggleUniversalPaste => {
+            let next = !state.queue.borrow().universal_paste;
+            set_universal_paste(state, next);
+        }
+        TrayCommand::PasteNext => {
+            let prev = state.engine.borrow().as_ref().and_then(|e| e.active_window());
+            trigger_paste_next(state, prev);
+        }
+        TrayCommand::ClearQueue => handle_queue_ui_action(state, QueueUiAction::ClearQueue),
         TrayCommand::ToggleAutostart => {
             let next = !autostart::is_autostart_enabled();
             match autostart::set_autostart_enabled(next) {
@@ -738,6 +758,193 @@ fn handle_ui_action(state: &Rc<AppState>, action: UiAction) {
                 .update_clip_meta(clip_id, meta.as_deref());
             refresh_open_views(state);
         }
+        UiAction::AddToQueue(clip_id) => {
+            if state.store.borrow_mut().queue_enqueue(clip_id).is_ok() {
+                sync_queue_indicators(state);
+            }
+        }
+        UiAction::Queue(qa) => handle_queue_ui_action(state, qa),
+        UiAction::ToggleUniversalPasteShortcut => {
+            let next = !state.queue.borrow().universal_paste;
+            set_universal_paste(state, next);
+        }
+    }
+}
+
+fn sync_queue_indicators(state: &Rc<AppState>) {
+    let count = state.store.borrow().queue_count().unwrap_or(0);
+    let (universal, manual) = {
+        let q = state.queue.borrow();
+        (q.universal_paste, q.manual_mode)
+    };
+    if let Some(ref handle) = *state.tray.borrow() {
+        handle.update(|t| {
+            t.universal_paste = universal;
+            t.queue_count = count;
+        });
+    }
+    if let Some(ref win) = *state.main_window.borrow() {
+        win.sync_queue_state(universal, manual, count);
+    }
+}
+
+fn set_universal_paste(state: &Rc<AppState>, enabled: bool) {
+    state.queue.borrow_mut().universal_paste = enabled;
+    sync_queue_indicators(state);
+    send_notification(
+        &state.app,
+        "universal-paste",
+        "PasteFlow",
+        if enabled {
+            "Universal Paste ON — every copy joins the queue."
+        } else {
+            "Universal Paste OFF."
+        },
+    );
+}
+
+fn handle_queue_ui_action(state: &Rc<AppState>, action: QueueUiAction) {
+    match action {
+        QueueUiAction::ToggleUniversalPaste(enabled) => set_universal_paste(state, enabled),
+        QueueUiAction::ToggleManualMode(manual) => {
+            state.queue.borrow_mut().manual_mode = manual;
+            sync_queue_indicators(state);
+        }
+        QueueUiAction::PasteNext => {
+            let prev = state.engine.borrow().as_ref().and_then(|e| e.active_window());
+            trigger_paste_next(state, prev);
+        }
+        QueueUiAction::SkipHead => {
+            if let Ok(Some(head)) = state.store.borrow().queue_peek_head() {
+                let _ = state.store.borrow_mut().queue_remove(head.id);
+                sync_queue_indicators(state);
+            }
+        }
+        QueueUiAction::ClearQueue => {
+            let _ = state.store.borrow_mut().queue_clear();
+            {
+                let mut q = state.queue.borrow_mut();
+                q.in_flight = None;
+                q.buffered_presses = 0;
+            }
+            sync_queue_indicators(state);
+        }
+        QueueUiAction::MoveItem {
+            queue_item_id,
+            delta,
+        } => {
+            let _ = state.store.borrow_mut().queue_move(queue_item_id, delta);
+            sync_queue_indicators(state);
+        }
+        QueueUiAction::RemoveItem(qid) => {
+            let _ = state.store.borrow_mut().queue_remove(qid);
+            sync_queue_indicators(state);
+        }
+    }
+}
+
+fn trigger_paste_next(state: &Rc<AppState>, target_window: Option<u32>) {
+    // Buffer rapid presses while an auto-paste is in flight (§16 #1)
+    {
+        let mut q = state.queue.borrow_mut();
+        if q.in_flight.is_some() && !q.manual_mode {
+            q.buffered_presses += 1;
+            return;
+        }
+    }
+
+    let head = match state.store.borrow().queue_peek_head() {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            send_notification(&state.app, "queue", "Paste Queue", "Paste Queue is empty.");
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to peek paste queue");
+            return;
+        }
+    };
+
+    let formats = match state.store.borrow().get_clip_formats(head.clip_id) {
+        Ok(f) if !f.is_empty() => f,
+        _ => {
+            let _ = state.store.borrow_mut().queue_remove(head.id);
+            sync_queue_indicators(state);
+            return;
+        }
+    };
+
+    if let Some(ref mut eng) = *state.engine.borrow_mut() {
+        if let Err(e) = eng.own_clipboard(formats) {
+            warn!(error = %e, "failed to own clipboard for queue head");
+            return;
+        }
+    }
+
+    let manual = state.queue.borrow().manual_mode;
+    let remaining = state.store.borrow().queue_count().unwrap_or(1);
+
+    if manual {
+        let _ = state.queue.borrow_mut().begin_in_flight(head.id);
+        let short_preview: String = head.clip.preview.chars().take(40).collect();
+        send_notification(
+            &state.app,
+            "queue-manual",
+            "Paste Queue (Manual)",
+            &format!("Next: {short_preview} — {remaining} left. Press Ctrl+V."),
+        );
+        return;
+    }
+
+    // Auto X11 mode: inject Ctrl+V (or Ctrl+Shift+V for terminals) and wait up to 2 s for SelectionRequest
+    let generation = state.queue.borrow_mut().begin_in_flight(head.id);
+    if let Some(ref eng) = *state.engine.borrow() {
+        if let Err(e) = eng.send_paste_chord(target_window) {
+            warn!(error = %e, "XTEST paste failed; falling back to manual");
+            state.queue.borrow_mut().in_flight = None;
+            send_notification(
+                &state.app,
+                "queue-fallback",
+                "Paste Queue",
+                "Paste not detected — press Ctrl+V manually.",
+            );
+            return;
+        }
+    }
+
+    let st_c = Rc::clone(state);
+    glib::timeout_add_local_once(Duration::from_secs(2), move || {
+        if st_c.queue.borrow_mut().handle_timeout(generation) {
+            send_notification(
+                &st_c.app,
+                "queue-timeout",
+                "Paste Queue",
+                "Paste not detected — press Ctrl+V manually.",
+            );
+        }
+    });
+}
+
+fn confirm_in_flight_paste(state: &Rc<AppState>) {
+    let confirmed_qid = state.queue.borrow_mut().confirm_served();
+    let Some(qid) = confirmed_qid else {
+        return;
+    };
+
+    let _ = state.store.borrow_mut().queue_remove(qid);
+    let left = state.store.borrow().queue_count().unwrap_or(0);
+    if left == 0 && state.queue.borrow().universal_paste {
+        state.queue.borrow_mut().universal_paste = false;
+        send_notification(&state.app, "queue-done", "Paste Queue", "All queued items pasted.");
+    }
+    sync_queue_indicators(state);
+
+    if left > 0 && state.queue.borrow_mut().take_buffered_press() {
+        let st_c = Rc::clone(state);
+        glib::timeout_add_local_once(Duration::from_millis(50), move || {
+            let prev = st_c.engine.borrow().as_ref().and_then(|e| e.active_window());
+            trigger_paste_next(&st_c, prev);
+        });
     }
 }
 

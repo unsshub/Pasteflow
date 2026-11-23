@@ -1,4 +1,5 @@
 use crate::ui::detail::{DetailAction, DetailPanel};
+use crate::ui::queue_view::{QueueUiAction, QueueView};
 use crate::ui::{format_bytes, format_relative_time};
 use gtk4::gio;
 use gtk4::glib;
@@ -29,10 +30,14 @@ pub enum UiAction {
     OpenImageInViewer(i64),
     OpenUrl(String),
     SetLanguage { clip_id: i64, lang: String },
+    AddToQueue(i64),
+    Queue(QueueUiAction),
+    ToggleUniversalPasteShortcut,
 }
 
 #[derive(Debug, Clone, Default)]
 struct NavSelection {
+    show_queue: bool,
     pinned_only: bool,
     kind: Option<ClipKind>,
     kinds: Vec<ClipKind>,
@@ -46,6 +51,8 @@ pub struct MainWindow {
     selection: SingleSelection,
     search_entry: SearchEntry,
     stack: Stack,
+    queue_view: Rc<QueueView>,
+    queue_badge: Label,
     paused_banner: Label,
     pause_btn: ToggleButton,
     status_label: Label,
@@ -126,6 +133,31 @@ impl MainWindow {
                 ..Default::default()
             },
         );
+
+        // Paste Queue row with live count badge
+        let queue_badge = Label::new(Some("0"));
+        queue_badge.add_css_class("pf-kind-badge");
+        {
+            let h = GtkBox::new(Orientation::Horizontal, 8);
+            h.set_margin_top(4);
+            h.set_margin_bottom(4);
+            h.set_margin_start(6);
+            h.set_margin_end(6);
+            let img = Image::from_icon_name("view-list-ordered-symbolic");
+            let lbl = Label::new(Some("Paste Queue"));
+            lbl.set_xalign(0.0);
+            lbl.set_hexpand(true);
+            h.append(&img);
+            h.append(&lbl);
+            h.append(&queue_badge);
+            let row = ListBoxRow::new();
+            row.set_child(Some(&h));
+            nav_list.append(&row);
+            nav_targets.push(NavSelection {
+                show_queue: true,
+                ..Default::default()
+            });
+        }
 
         let add_section_header = |list: &ListBox, targets: &mut Vec<NavSelection>, title: &str| {
             let lbl = Label::new(Some(title));
@@ -314,7 +346,18 @@ impl MainWindow {
         paned.set_shrink_start_child(false);
         paned.set_shrink_end_child(false);
         paned.set_position(460);
-        content_vbox.append(&paned);
+        let on_queue_action: Rc<dyn Fn(QueueUiAction)> = {
+            let act = Rc::clone(&on_action);
+            Rc::new(move |qa| act(UiAction::Queue(qa)))
+        };
+        let queue_view = Rc::new(QueueView::new(Rc::clone(&store), on_queue_action));
+
+        let main_stack = Stack::new();
+        main_stack.set_vexpand(true);
+        main_stack.set_hexpand(true);
+        main_stack.add_named(&paned, Some("clips"));
+        main_stack.add_named(queue_view.widget(), Some("queue"));
+        content_vbox.append(&main_stack);
 
         // Update detail panel whenever selection changes
         {
@@ -359,6 +402,8 @@ impl MainWindow {
             selection,
             search_entry,
             stack,
+            queue_view,
+            queue_badge,
             paused_banner,
             pause_btn,
             status_label,
@@ -413,6 +458,8 @@ impl MainWindow {
             let nav_c = Rc::clone(&main_win.nav_state);
             let store_c = Rc::clone(&main_win.store);
             let search_c = main_win.search_entry.clone();
+            let qv_c = Rc::clone(&main_win.queue_view);
+            let mstack_c = main_stack.clone();
             let targets = Rc::new(nav_targets);
             nav_list.connect_row_selected(move |_lb, row_opt| {
                 let Some(row) = row_opt else { return };
@@ -422,14 +469,20 @@ impl MainWindow {
                 }
                 if let Some(target) = targets.get(idx as usize) {
                     *nav_c.borrow_mut() = target.clone();
-                    reload_list(
-                        &store_c.borrow(),
-                        &model_c,
-                        &stack_c,
-                        &status_c,
-                        &nav_c.borrow(),
-                        search_c.text().as_str(),
-                    );
+                    if target.show_queue {
+                        qv_c.refresh();
+                        mstack_c.set_visible_child_name("queue");
+                    } else {
+                        mstack_c.set_visible_child_name("clips");
+                        reload_list(
+                            &store_c.borrow(),
+                            &model_c,
+                            &stack_c,
+                            &status_c,
+                            &nav_c.borrow(),
+                            search_c.text().as_str(),
+                        );
+                    }
                 }
             });
         }
@@ -445,8 +498,13 @@ impl MainWindow {
 
             key_ctrl.connect_key_pressed(move |_ctrl, key, _code, mods| {
                 let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
+                let shift = mods.contains(gdk::ModifierType::SHIFT_MASK);
                 if key == gdk::Key::F9 {
                     dt_btn.set_active(!dt_btn.is_active());
+                    return glib::Propagation::Stop;
+                }
+                if ctrl && shift && (key == gdk::Key::u || key == gdk::Key::U) {
+                    act_c(UiAction::ToggleUniversalPasteShortcut);
                     return glib::Propagation::Stop;
                 }
                 if ctrl && (key == gdk::Key::f || key == gdk::Key::F) {
@@ -464,6 +522,10 @@ impl MainWindow {
                 if let Some(id) = selected_clip_id(&sel_c) {
                     if ctrl && (key == gdk::Key::p || key == gdk::Key::P) {
                         act_c(UiAction::TogglePin(id));
+                        return glib::Propagation::Stop;
+                    }
+                    if ctrl && (key == gdk::Key::q || key == gdk::Key::Q) {
+                        act_c(UiAction::AddToQueue(id));
                         return glib::Propagation::Stop;
                     }
                     if key == gdk::Key::Delete && !search_c.has_focus() {
@@ -510,7 +572,16 @@ impl MainWindow {
         }
     }
 
+    pub fn sync_queue_state(&self, universal: bool, manual: bool, count: usize) {
+        self.queue_badge.set_text(&count.to_string());
+        self.queue_view.sync_switches(universal, manual);
+        self.queue_view.refresh();
+    }
+
     pub fn refresh(&self) {
+        let qcount = self.store.borrow().queue_count().unwrap_or(0);
+        self.queue_badge.set_text(&qcount.to_string());
+        self.queue_view.refresh();
         reload_list(
             &self.store.borrow(),
             &self.model,
@@ -680,7 +751,25 @@ fn build_row_factory(
                 });
             }
 
+            let queue_btn = Button::builder()
+                .icon_name("list-add-symbolic")
+                .tooltip_text("Add to Paste Queue (Ctrl+Q)")
+                .has_frame(false)
+                .valign(Align::Center)
+                .build();
+            {
+                let id_c = Rc::clone(&clip_id);
+                let act = Rc::clone(&on_action_setup);
+                queue_btn.connect_clicked(move |_| {
+                    let id = id_c.get();
+                    if id > 0 {
+                        act(UiAction::AddToQueue(id));
+                    }
+                });
+            }
+
             row_box.append(&pin_btn);
+            row_box.append(&queue_btn);
             row_box.append(&copy_btn);
             row_box.append(&del_btn);
 

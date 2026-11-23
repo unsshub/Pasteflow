@@ -6,8 +6,9 @@ use anyhow::{Context, Result, bail};
 use blobs::BlobStore;
 use pf_core::config::{AppPaths, Config};
 use pf_core::model::{
-    ClipFilter, ClipKind, ClipRecord, ImageMeta, RawClip, RawFormat, SelectionKind, SpaceRecord,
-    canonical_hash, is_url_or_filename_only, make_search_text, make_text_preview, parse_file_list,
+    ClipFilter, ClipKind, ClipRecord, ImageMeta, QueueItemRecord, RawClip, RawFormat,
+    SelectionKind, SpaceRecord, canonical_hash, is_url_or_filename_only, make_search_text,
+    make_text_preview, now_unix_ms, parse_file_list,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::HashSet;
@@ -514,6 +515,137 @@ impl Store {
         Ok(deleted)
     }
 
+    /// List all Paste Queue items in FIFO order (`ord ASC`).
+    pub fn queue_list(&self) -> Result<Vec<QueueItemRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT q.id, q.clip_id, q.ord, q.added_at,
+                    c.id, c.kind, c.content_hash, c.title, c.preview, c.search_text, c.meta,
+                    c.byte_size, c.space_id, c.pinned, c.selection, c.source_app,
+                    c.created_at, c.last_used_at, c.copy_count, c.expires_at,
+                    i.width, i.height, i.original_mime, i.thumb_key
+             FROM queue_items q
+             JOIN clips c ON c.id = q.clip_id
+             LEFT JOIN images i ON i.clip_id = c.id
+             ORDER BY q.ord ASC, q.id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let kind_s: String = r.get(5)?;
+            let hash_vec: Vec<u8> = r.get(6)?;
+            let mut content_hash = [0u8; 32];
+            if hash_vec.len() == 32 {
+                content_hash.copy_from_slice(&hash_vec);
+            }
+            let sel_s: String = r.get(14)?;
+            let img_w: Option<i64> = r.get(20)?;
+            let image = match img_w {
+                Some(w) => Some(ImageMeta {
+                    width: u32::try_from(w).unwrap_or(0),
+                    height: u32::try_from(r.get::<_, i64>(21)?).unwrap_or(0),
+                    original_mime: r.get(22)?,
+                    thumb_key: r.get(23)?,
+                }),
+                None => None,
+            };
+            Ok(QueueItemRecord {
+                id: r.get(0)?,
+                clip_id: r.get(1)?,
+                ord: r.get(2)?,
+                added_at: r.get(3)?,
+                clip: ClipRecord {
+                    id: r.get(4)?,
+                    kind: ClipKind::from_db(&kind_s).unwrap_or(ClipKind::Text),
+                    content_hash,
+                    title: r.get(7)?,
+                    preview: r.get(8)?,
+                    search_text: r.get(9)?,
+                    meta: r.get(10)?,
+                    byte_size: r.get(11)?,
+                    space_id: r.get(12)?,
+                    pinned: r.get::<_, i64>(13)? != 0,
+                    selection: SelectionKind::from_db(&sel_s).unwrap_or(SelectionKind::Clipboard),
+                    source_app: r.get(15)?,
+                    created_at: r.get(16)?,
+                    last_used_at: r.get(17)?,
+                    copy_count: r.get(18)?,
+                    expires_at: r.get(19)?,
+                    image,
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn queue_count(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM queue_items", [], |r| r.get(0))?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    pub fn queue_enqueue(&mut self, clip_id: i64) -> Result<i64> {
+        let next_ord: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(ord), -1) + 1 FROM queue_items",
+            [],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO queue_items (clip_id, ord, added_at) VALUES (?1, ?2, ?3)",
+            params![clip_id, next_ord, now_unix_ms()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn queue_peek_head(&self) -> Result<Option<QueueItemRecord>> {
+        Ok(self.queue_list()?.into_iter().next())
+    }
+
+    pub fn queue_remove(&mut self, queue_item_id: i64) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        let deleted = tx.execute("DELETE FROM queue_items WHERE id = ?1", params![queue_item_id])?;
+        if deleted > 0 {
+            renumber_queue_tx(&tx)?;
+        }
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+
+    /// Move a queue item up (`delta = -1`) or down (`delta = 1`) and renumber `ord`.
+    pub fn queue_move(&mut self, queue_item_id: i64, delta: i32) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        let mut ids: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM queue_items ORDER BY ord ASC, id ASC")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let Some(pos) = ids.iter().position(|&id| id == queue_item_id) else {
+            return Ok(false);
+        };
+        let target = (pos as isize + delta as isize).clamp(0, (ids.len().saturating_sub(1)) as isize)
+            as usize;
+        if target == pos {
+            return Ok(false);
+        }
+        let item = ids.remove(pos);
+        ids.insert(target, item);
+        for (ord, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE queue_items SET ord = ?1 WHERE id = ?2",
+                params![ord as i64, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn queue_clear(&mut self) -> Result<usize> {
+        let deleted = self.conn.execute("DELETE FROM queue_items", [])?;
+        Ok(deleted)
+    }
+
     /// Sweep `blobs/` for files that are not referenced by any row in `clip_formats`.
     pub fn sweep_orphan_blobs(&self) -> Result<usize> {
         let mut stmt = self
@@ -819,6 +951,21 @@ fn row_to_clip(r: &rusqlite::Row<'_>) -> rusqlite::Result<ClipRecord> {
     })
 }
 
+fn renumber_queue_tx(tx: &Transaction<'_>) -> Result<()> {
+    let ids: Vec<i64> = {
+        let mut stmt = tx.prepare("SELECT id FROM queue_items ORDER BY ord ASC, id ASC")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (ord, id) in ids.iter().enumerate() {
+        tx.execute(
+            "UPDATE queue_items SET ord = ?1 WHERE id = ?2",
+            params![ord as i64, id],
+        )?;
+    }
+    Ok(())
+}
+
 fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
@@ -1039,6 +1186,43 @@ mod tests {
         let removed = store.sweep_orphan_blobs().unwrap();
         assert_eq!(removed, 1);
         assert!(!store.blobs().blobs_dir().join(orphan_key).exists());
+    }
+
+    #[test]
+    fn queue_fifo_reorder_and_clear() {
+        let (_dir, mut store) = test_store();
+        let cfg = Config::default();
+        let c1 = match store.insert_raw_clip(&raw_text("first item", 100), &cfg).unwrap() {
+            InsertOutcome::Inserted(c) => c.id,
+            _ => unreachable!(),
+        };
+        let c2 = match store.insert_raw_clip(&raw_text("second item", 200), &cfg).unwrap() {
+            InsertOutcome::Inserted(c) => c.id,
+            _ => unreachable!(),
+        };
+        let c3 = match store.insert_raw_clip(&raw_text("third item", 300), &cfg).unwrap() {
+            InsertOutcome::Inserted(c) => c.id,
+            _ => unreachable!(),
+        };
+
+        let q1 = store.queue_enqueue(c1).unwrap();
+        let q2 = store.queue_enqueue(c2).unwrap();
+        let q3 = store.queue_enqueue(c3).unwrap();
+        assert_eq!(store.queue_count().unwrap(), 3);
+
+        // Move q3 up by 1 -> [q1, q3, q2]
+        assert!(store.queue_move(q3, -1).unwrap());
+        let list = store.queue_list().unwrap();
+        let order: Vec<i64> = list.iter().map(|i| i.id).collect();
+        assert_eq!(order, vec![q1, q3, q2]);
+
+        // Remove head q1 -> [q3, q2]
+        assert!(store.queue_remove(q1).unwrap());
+        let head = store.queue_peek_head().unwrap().unwrap();
+        assert_eq!(head.id, q3);
+
+        assert_eq!(store.queue_clear().unwrap(), 2);
+        assert_eq!(store.queue_count().unwrap(), 0);
     }
 
     fn walk_files(dir: &Path) -> usize {

@@ -166,6 +166,15 @@ pub struct SpaceRecord {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueItemRecord {
+    pub id: i64,
+    pub clip_id: i64,
+    pub ord: i64,
+    pub added_at: i64,
+    pub clip: ClipRecord,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ClipFilter {
     pub query: Option<String>,

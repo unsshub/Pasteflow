@@ -1,6 +1,7 @@
 mod app;
 mod autostart;
 mod cinnamon_keys;
+mod queue;
 mod tray;
 mod ui;
 
@@ -141,7 +142,7 @@ fn run_headless() -> Result<()> {
                     Err(e) => warn!(error = %e, "failed to persist clip"),
                 },
                 ClipboardEvent::OwnerVanished { .. } => {}
-                ClipboardEvent::SelectionServed { target } => {
+                ClipboardEvent::SelectionServed { target, .. } => {
                     info!(target = %target, "served clipboard target");
                 }
                 ClipboardEvent::HotkeyPressed { .. } => {}

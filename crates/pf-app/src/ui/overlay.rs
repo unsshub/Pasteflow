@@ -41,6 +41,7 @@ pub enum OverlayAction {
         previous_window: Option<u32>,
     },
     TogglePin(i64),
+    AddToQueue(i64),
     DeleteClip(i64),
     Closed {
         previous_window: Option<u32>,
@@ -274,6 +275,12 @@ impl OverlayWindow {
                     if key == gdk::Key::p || key == gdk::Key::P {
                         if let Some(clip_id) = selected_overlay_id(&sel_c) {
                             act_c(OverlayAction::TogglePin(clip_id));
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    if key == gdk::Key::q || key == gdk::Key::Q {
+                        if let Some(clip_id) = selected_overlay_id(&sel_c) {
+                            act_c(OverlayAction::AddToQueue(clip_id));
                             return glib::Propagation::Stop;
                         }
                     }

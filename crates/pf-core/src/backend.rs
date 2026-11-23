@@ -16,7 +16,10 @@ pub enum ClipboardEvent {
     /// The previous selection owner vanished (`SelectionClientClose` / `WindowDestroy`).
     OwnerVanished { selection: SelectionKind },
     /// PasteFlow served a data target to an external requestor.
-    SelectionServed { target: String },
+    SelectionServed {
+        target: String,
+        is_clipboard_manager: bool,
+    },
     /// A registered global hotkey was pressed.
     HotkeyPressed {
         action: HotkeyAction,

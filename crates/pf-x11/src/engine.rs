@@ -818,7 +818,24 @@ impl X11Engine {
             .send_event(false, req.requestor, xproto::EventMask::NO_EVENT, notify)?;
         self.conn.flush()?;
 
-        Ok(served_target.map(|target| ClipboardEvent::SelectionServed { target }))
+        let is_clipboard_manager = if served_target.is_some() {
+            let cm_owner = self
+                .conn
+                .get_selection_owner(self.atoms.clipboard_manager)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| r.owner)
+                .unwrap_or(x11rb::NONE);
+            req.requestor == self.window
+                || (cm_owner != x11rb::NONE && req.requestor == cm_owner)
+        } else {
+            false
+        };
+
+        Ok(served_target.map(|target| ClipboardEvent::SelectionServed {
+            target,
+            is_clipboard_manager,
+        }))
     }
 
     fn advertised_target_atoms(&mut self) -> Result<Vec<xproto::Atom>> {
