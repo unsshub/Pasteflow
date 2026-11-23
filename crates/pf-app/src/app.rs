@@ -295,6 +295,17 @@ fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
 
     let engine_fd = engine.as_ref().map(|e| e.as_raw_fd());
 
+    let is_wayland = std::env::var("XDG_SESSION_TYPE")
+        .map(|s| s.eq_ignore_ascii_case("wayland"))
+        .unwrap_or(false);
+    let mut initial_queue = QueueController::default();
+    if is_wayland {
+        // M10 degraded Wayland mode: XTEST synthesis cannot reach native Wayland windows,
+        // so default the Paste Queue to manual-paste mode.
+        initial_queue.manual_mode = true;
+        info!("Wayland session detected; enabling degraded mode (manual Paste Queue, centered overlay)");
+    }
+
     let state = Rc::new(AppState {
         app: app.clone(),
         paths,
@@ -302,7 +313,7 @@ fn init_primary_instance(app: &Application) -> Result<Rc<AppState>> {
         store: Rc::new(RefCell::new(store)),
         ephemeral: Rc::new(RefCell::new(EphemeralStore::new())),
         engine: RefCell::new(engine),
-        queue: RefCell::new(QueueController::default()),
+        queue: RefCell::new(initial_queue),
         x11_source_id: Cell::new(None),
         expiry_timer_gen: Cell::new(0),
         hotkey_statuses: RefCell::new(Vec::new()),

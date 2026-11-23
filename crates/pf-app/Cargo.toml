@@ -3,6 +3,26 @@ name = "pf-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "PasteFlow — Native Linux GTK4 clipboard manager"
+
+[package.metadata.deb]
+name = "pasteflow"
+maintainer = "PasteFlow Contributors <pasteflow@local>"
+copyright = "2026, PasteFlow Contributors"
+section = "utils"
+priority = "optional"
+depends = "$auto, libgtk-4-1 (>= 4.14), libgtksourceview-5-0"
+extended-description = """\
+PasteFlow is a fast, offline-first native GTK4 clipboard manager for Linux Mint Cinnamon (X11).
+Features event-driven XFixes capture, SQLite FTS5 trigram search, smart content recognition,
+Spaces, a sequential Paste Queue, and memory-only storage for sensitive clips."""
+assets = [
+    ["target/release/pasteflow", "usr/bin/pasteflow", "755"],
+    ["data/app.pasteflow.PasteFlow.desktop", "usr/share/applications/app.pasteflow.PasteFlow.desktop", "644"],
+    ["data/app.pasteflow.PasteFlow.metainfo.xml", "usr/share/metainfo/app.pasteflow.PasteFlow.metainfo.xml", "644"],
+    ["data/icons/hicolor/scalable/apps/app.pasteflow.PasteFlow.svg", "usr/share/icons/hicolor/scalable/apps/app.pasteflow.PasteFlow.svg", "644"],
+]
+maintainer-scripts = "packaging/deb/"
 
 [[bin]]
 name = "pasteflow"
