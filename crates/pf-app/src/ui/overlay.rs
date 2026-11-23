@@ -85,7 +85,7 @@ impl OverlayWindow {
         top_bar.add_css_class("pf-toolbar");
 
         let search_entry = SearchEntry::new();
-        search_entry.set_placeholder_text(Some("Type to search… (Enter copy · Shift+Enter paste)"));
+        search_entry.set_placeholder_text(Some("Type to search… (Enter / Click paste · Shift+Enter copy only)"));
         search_entry.set_hexpand(true);
         top_bar.append(&search_entry);
 
@@ -108,7 +108,7 @@ impl OverlayWindow {
         let filter_idx = Rc::new(Cell::new(0usize));
         let last_shown_at = Rc::new(Cell::new(Instant::now() - Duration::from_secs(10)));
 
-        // Clicking a row copies & closes
+        // Clicking a row copies & auto-pastes into the previous window
         {
             let sel_c = selection.clone();
             let prev_c = Rc::clone(&previous_window);
@@ -122,7 +122,7 @@ impl OverlayWindow {
                     if let Some(w) = win_weak.upgrade() {
                         w.set_visible(false);
                     }
-                    act_c(OverlayAction::CopyAndClose {
+                    act_c(OverlayAction::PasteAndClose {
                         clip_id,
                         previous_window: prev_c.get(),
                     });
@@ -140,7 +140,7 @@ impl OverlayWindow {
 
         vbox.append(&Separator::new(Orientation::Horizontal));
         let footer = Label::new(Some(
-            "↑↓ Navigate · Enter Copy · Shift+Enter Paste · Ctrl+1-9 Quick · Tab Filter · Esc Close",
+            "↑↓ Navigate · Enter/Click Paste · Shift+Enter Copy · Ctrl+1-9 Quick · Tab Filter · Esc Close",
         ));
         footer.add_css_class("pf-clip-meta");
         footer.set_margin_top(4);
@@ -300,12 +300,12 @@ impl OverlayWindow {
                             w.set_visible(false);
                         }
                         if shift {
-                            act_c(OverlayAction::PasteAndClose {
+                            act_c(OverlayAction::CopyAndClose {
                                 clip_id,
                                 previous_window: prev_c.get(),
                             });
                         } else {
-                            act_c(OverlayAction::CopyAndClose {
+                            act_c(OverlayAction::PasteAndClose {
                                 clip_id,
                                 previous_window: prev_c.get(),
                             });

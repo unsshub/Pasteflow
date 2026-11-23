@@ -793,14 +793,16 @@ fn handle_overlay_action(state: &Rc<AppState>, action: OverlayAction) {
             {
                 let _ = eng.focus_window(prev);
             }
-            // Brief delay so Muffin finishes restoring focus before XTEST injects Ctrl+V
+            // Wait briefly so Muffin finishes unmapping the overlay and restoring focus
+            // to the previous window before XTEST injects Ctrl+V (or Ctrl+Shift+V).
             let st_c = Rc::clone(state);
-            glib::timeout_add_local_once(Duration::from_millis(60), move || {
+            glib::timeout_add_local_once(Duration::from_millis(120), move || {
                 if let Some(ref eng) = *st_c.engine.borrow() {
                     if let Err(e) = eng.send_paste_chord(previous_window) {
                         warn!(error = %e, "synthetic paste failed");
                     }
                 }
+                drain_buffered_x11_events(&st_c);
             });
         }
         OverlayAction::TogglePin(id) => handle_ui_action(state, UiAction::TogglePin(id)),
@@ -885,6 +887,10 @@ fn copy_clip_to_clipboard(state: &Rc<AppState>, id: i64) {
         }
         info!(id, "copied clip back to CLIPBOARD");
     }
+    let st_drain = Rc::clone(state);
+    glib::idle_add_local_once(move || {
+        drain_buffered_x11_events(&st_drain);
+    });
 }
 
 fn handle_ui_action(state: &Rc<AppState>, action: UiAction) {
