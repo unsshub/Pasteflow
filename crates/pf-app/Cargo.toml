@@ -14,6 +14,7 @@ path = "src/bin/pf-m0-spike.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
 gdk4-x11.workspace = true
 gtk4.workspace = true
 ksni.workspace = true

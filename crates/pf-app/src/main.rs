@@ -1,3 +1,8 @@
+mod app;
+mod autostart;
+mod tray;
+mod ui;
+
 use anyhow::{Context, Result, bail};
 use pf_core::backend::{ClipboardBackend, ClipboardEvent};
 use pf_core::config::{AppPaths, Config};
@@ -38,8 +43,7 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        print_usage();
-        return Ok(());
+        return app::run_gui(&args);
     }
 
     match args[0].as_str() {
@@ -50,6 +54,9 @@ fn main() -> Result<()> {
         "--version" | "-V" => {
             println!("pasteflow {}", env!("CARGO_PKG_VERSION"));
             Ok(())
+        }
+        "--background" | "--toggle" | "--paste-next" | "--quit" | "--exit-after-ready" => {
+            app::run_gui(&args)
         }
         "--headless" => run_headless(),
         "list" => cmd_list(&args[1..]),
@@ -66,9 +73,16 @@ fn main() -> Result<()> {
 
 fn print_usage() {
     println!(
-        "PasteFlow {} — Native Linux clipboard manager (M1 headless/CLI)\n\
+        "PasteFlow {} — Native Linux clipboard manager\n\
          \n\
-         USAGE:\n\
+         GUI & LIFECYCLE:\n\
+         \tpasteflow                            Launch or focus PasteFlow window\n\
+         \tpasteflow --background               Start resident in tray with no window\n\
+         \tpasteflow --toggle                   Toggle PasteFlow window (single-instance)\n\
+         \tpasteflow --paste-next               Paste next queued item (single-instance)\n\
+         \tpasteflow --quit                     Gracefully quit running PasteFlow instance\n\
+         \n\
+         HEADLESS & CLI:\n\
          \tpasteflow --headless                 Run headless X11 clipboard daemon\n\
          \tpasteflow list [--limit N] [--kind K] [--pinned]\n\
          \tpasteflow search <query> [--limit N] [--kind K]\n\
